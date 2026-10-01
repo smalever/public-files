@@ -1,0 +1,132 @@
+# Каталог навыков персонального бота Hermes.
+# Читает навык bot-help (scripts/skills_update.py). Даты — YYYY-MM-DD.
+# path — папка навыка в этом каталоге; target — куда ставится относительно /opt/data;
+# files — общие скрипты навыка (/opt/data/scripts).
+author: Viktor Filatov
+source: https://github.com/smalever/public-files
+license: CC-BY-4.0
+updated: 2026-10-01
+skills:
+  - name: finance
+    title: Личные финансы
+    summary: "Учёт расходов и доходов по счетам, несколько валют, категории, отчёты, заправки и расход топлива на 100 км, импорт выписок Сбера и Озон Банка."
+    version: 3.0.0
+    created: 2026-07-26
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/finance
+    target: skills-custom/finance/finance
+    python: [pyyaml]
+  - name: health-tracker
+    title: Здоровье
+    summary: "Дневник давления, пульса, сахара, веса; схема лекарств из Obsidian и отметка приёма каждого препарата; справочник препаратов с исправлением опечаток; графики."
+    version: 3.0.0
+    created: 2026-07-26
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/health-tracker
+    target: skills-custom/health/health-tracker
+    python: [pyyaml, matplotlib, numpy, pymupdf, pillow]
+    files:
+      - {from: scripts/health_sync.py, to: scripts/health_sync.py}
+      - {from: scripts/medication_reminder_helper.py, to: scripts/medication_reminder_helper.py}
+      - {from: scripts/health_monitoring.py, to: scripts/health_monitoring.py}
+      - {from: scripts/sync_lab_results_to_obsidian.py, to: scripts/sync_lab_results_to_obsidian.py}
+      - {from: scripts/tests/test_medication_reminder_helper.py, to: scripts/tests/test_medication_reminder_helper.py}
+      - {from: scripts/tests/test_health_monitoring.py, to: scripts/tests/test_health_monitoring.py}
+  - name: medical-import
+    title: Импорт анализов
+    summary: "Анализы и заключения врачей из PDF и фото: распознавание, черновик, двойное подтверждение, запись в базу без дублей."
+    version: 4.0.0
+    created: 2026-09-20
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/medical-import
+    target: skills-custom/health/medical-import
+    requires: [health-tracker]
+    python: [pymupdf, pillow]
+  - name: nutrition
+    title: Питание
+    summary: "Дневник питания с КБЖУ по собственному справочнику продуктов и алиасов; напоминание о лекарствах «во время/после еды» при записи приёма пищи."
+    version: 3.0.0
+    created: 2026-07-26
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/nutrition
+    target: skills-custom/health/nutrition
+    requires: [health-tracker]
+    python: [pyyaml, matplotlib]
+    files:
+      - {from: scripts/tests/test_meal_food_rules.py, to: scripts/tests/test_meal_food_rules.py}
+  - name: recipe-assistant
+    title: Рецепты
+    summary: "Одно блюдо из того, что есть дома: под остаток КБЖУ на сегодня или без ограничений, если цели не заданы."
+    version: 0.4.0
+    created: 2026-09-23
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/recipe-assistant
+    target: skills-custom/health/recipe-assistant
+    requires: [nutrition, health-tracker]
+    python: [pyyaml]
+    files:
+      - {from: scripts/recipe_context.py, to: scripts/recipe_context.py}
+      - {from: scripts/tests/test_recipe_context.py, to: scripts/tests/test_recipe_context.py}
+  - name: health-reminder
+    title: Брифы здоровья
+    summary: "Утренний бриф, брифы «до еды», итоги дня по лекарствам и воскресный обзор с графиком; молчат, когда напоминать нечего."
+    version: 3.0.0
+    created: 2026-07-26
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/health-reminder
+    target: skills-custom/health/health-reminder
+    requires: [health-tracker, nutrition]
+    python: [pyyaml, matplotlib]
+    files:
+      - {from: scripts/health_reminder_morning.py, to: scripts/health_reminder_morning.py}
+      - {from: scripts/health_reminder_lunch.py, to: scripts/health_reminder_lunch.py}
+      - {from: scripts/health_reminder_dinner.py, to: scripts/health_reminder_dinner.py}
+      - {from: scripts/health_reminder_premeal.py, to: scripts/health_reminder_premeal.py}
+      - {from: scripts/health_reminder_evening.py, to: scripts/health_reminder_evening.py}
+      - {from: scripts/health_weekly_review.py, to: scripts/health_weekly_review.py}
+      - {from: scripts/plot_health_review.py, to: scripts/plot_health_review.py}
+      - {from: scripts/tests/test_health_reminder_morning.py, to: scripts/tests/test_health_reminder_morning.py}
+      - {from: scripts/tests/test_health_reminder_evening.py, to: scripts/tests/test_health_reminder_evening.py}
+  - name: ideas-inbox
+    title: Идеи
+    summary: "Быстрая запись идеи в Obsidian по шаблону с добавлением в индекс."
+    version: 2.1.0
+    created: 2026-07-26
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/ideas-inbox
+    target: skills-custom/notes/ideas-inbox
+  - name: notes-vault
+    title: Заметки
+    summary: "Правила vault владельца: структура, frontmatter, индексы, наведение порядка в заметках."
+    version: 2.0.0
+    created: 2026-09-27
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/notes-vault
+    target: skills-custom/notes/notes-vault
+  - name: web-search-fallbacks
+    title: Поиск без блокировок
+    summary: "Поиск источников, когда поисковики блокируют бота: curl с браузерным UA, проверка выдачи, разбор страниц."
+    version: 1.1.1
+    created: 2026-08-24
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/web-search-fallbacks
+    target: skills-custom/research/web-search-fallbacks
+  - name: bot-help
+    title: Справка и обновления
+    summary: "Ответ на «что ты умеешь» по справке, «что нового» по этому каталогу, установка и обновление навыков с согласия владельца и слиянием его правок."
+    version: 1.0.0
+    created: 2026-10-01
+    updated: 2026-10-01
+    changes: "Первая публикация: обезличенная версия для новых владельцев."
+    path: skills/bot-help
+    target: skills-custom/notes/bot-help
+    python: [pyyaml]
