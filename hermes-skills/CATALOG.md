@@ -1,6 +1,6 @@
 # Каталог навыков
 
-Навыки персонального Telegram-бота на [Hermes Agent](https://hermes-agent.nousresearch.com/). Машиночитаемая версия — [`catalog.yaml`](catalog.yaml).
+Навыки персонального Telegram-бота на [Hermes Agent](https://hermes-agent.nousresearch.com/). Машиночитаемая версия — [`catalog.yaml`](catalog.yaml) (и её копия [`catalog.json`](catalog.json) для скриптов без PyYAML; обновлять вместе).
 
 | Навык | Что умеет | Версия | Создан | Обновлён | Описание |
 |---|---|---|---|---|---|
