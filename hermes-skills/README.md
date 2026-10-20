@@ -1,33 +1,65 @@
-# hermes-skills
+# Общие навыки персонального Hermes
 
-Навыки для персонального Telegram-бота на [Hermes Agent](https://hermes-agent.nousresearch.com/): финансы, здоровье, питание, рецепты, импорт анализов, брифы, идеи, заметки, поиск, справка и обновления.
+Десять нейтральных навыков: финансы, здоровье, импорт анализов, питание, рецепты, брифы, идеи, заметки, MCP-поиск, справка и обновления.
 
-Список с датами и версиями — [CATALOG.md](CATALOG.md).
+- [Каталог и версии](CATALOG.md): canonical `catalog.yaml`, производный `catalog.json`.
+- [Что нового](RELEASES.md): машиночитаемый `releases.json` со стабильными ID.
+- Навыки — `skills/`; общие скрипты — `scripts/`; runtime-справка — `home/python-runtime.md`; стартовые заметки — `templates/notes/`.
 
-## Раскладка в боте
+## Раскладка
 
 ```text
-/opt/data/skills-custom/<категория>/<навык>/      навыки (skills.external_dirs + skills.create_dir)
-/opt/data/scripts/                               общие скрипты брифов и здоровья
-/opt/data/personal/{finance,health,nutrition}/   данные владельца: SQLite, документы, finance-settings.yaml
-/opt/data/home/.venv                             Python для скриптов: pyyaml matplotlib numpy pillow pymupdf
-/notes                                           Obsidian vault владельца (стартовые заметки — templates/notes)
+/opt/data/skills-custom/<категория>/<навык>/
+/opt/data/scripts/
+/opt/data/personal/{finance,health,nutrition}/
+/opt/data/home/.venv
+/notes
 ```
 
-## Установка и обновление
+Базовые зависимости пользовательского venv: PyYAML, matplotlib, numpy, Pillow, PyMuPDF; bot-help дополнительно требует packaging. Окружение создаёт администратор, не updater.
 
-В боте — навык `bot-help`: «что нового?» показывает новые и обновлённые навыки с прошлой проверки; установка — только после согласия владельца, с бэкапом; если владелец менял навык, бот показывает разницу и предлагает объединить правки.
+## Проверка каталога
+
+Публикация — не установка. Релиз не доказывает, что возможность установлена, включена, настроена или проверена у конкретного бота. Личные данные, память, credentials, cron и авторские личные навыки не входят в поставку.
+
+`bot-help` проверяет каталог по одному immutable SHA. Запрос «что нового» показывает изменения, но не устанавливает их. Новости различаются по ID и fingerprint, не только по дате.
 
 ```bash
 PY=/opt/data/home/.venv/bin/python
-$PY /opt/data/skills-custom/notes/bot-help/scripts/skills_update.py check
-$PY /opt/data/skills-custom/notes/bot-help/scripts/skills_update.py install <name> --yes
+UPDATER=/opt/data/skills-custom/notes/bot-help/scripts/skills_update.py
+$PY "$UPDATER" check
+$PY "$UPDATER" status
+$PY "$UPDATER" diff finance --commit <40-hex-SHA>
 ```
 
-## Данные
+`check --mark` сохраняет известные версии и новости. Без `--mark` просмотр не отмечает их прочитанными; загрузка может записывать cache. Offline fallback не обещается: при недоступности GitHub проверка возвращает ошибку.
 
-В навыках нет личных данных. Счета, цели, личные ориентиры и схема лекарств — у владельца: `finance-settings.yaml`, заметки `Моё здоровье/` (`targets`, `monitoring`, `medications`).
+## Установка — отдельная административная операция
+
+Для `fetch`, `adopt`, `install` обязателен точный 40-hex SHA. Администратор проверяет backup, совместимость, baseline, зависимости и отключает внешних writers в согласованном окне обслуживания. Сам updater доставляется доверенным административным способом, не старой небезопасной версией и не заменой своего исполняемого файла посреди транзакции.
+
+```bash
+$PY "$UPDATER" install finance --commit <40-hex-SHA>
+# После проверки плана и отдельного согласия:
+$PY "$UPDATER" install finance --commit <тот-же-40-hex-SHA> --yes
+```
+
+- `--force` запрещён. Локальные изменения, неизвестный baseline и удалённые upstream-файлы блокируют установку; требуется ручная административная reconciliation.
+- `--from-staging` — только точная доставка pinned source, не автоматическое слияние. Изменённый staging не принимается.
+- `adopt` фиксирует baseline только при полном совпадении с источником.
+- Общие файлы ограничены фиксированным списком updater; новый путь требует отдельно проверенной версии updater.
+- Зависимости диагностируются, но автоматически не устанавливаются. SQLite migration не запускается обновлением кода.
+- Lock/journal и fingerprints защищают согласованные операции updater, но не дают глобальной атомарности и защиты от внешних writers, игнорирующих lock. Конфликт recovery требует администратора.
+- `backup.py` — отключённая legacy-заглушка. Нельзя копировать работающие SQLite обычным `cp`: нужен согласованный consistent backup.
+- Численные медицинские эвристики отключены; подсказки используют условия еды из собственной схемы владельца, не назначают лечение. Legacy `wednesday_morning` сохранён только для совместимости, не является расписанием по умолчанию.
+- Native medical extraction требует совместимого provider и HTTPS (HTTP только loopback). Совместимость с частным HTTP endpoint не заявляется.
+
+Проверки выполнены на синтетических fixtures; полная live-приёмка на действующих ботах не заявляется. Стартовые заметки предназначены новым владельцам, существующие заметки автоматически не перезаписываются.
+
+## Административный выпуск
+
+Публикуется обезличенный diff по запросу владельца. Каталог проверяется и производные файлы генерируются административным `release_catalog.py` из приватного `hermes-bot-template`; публичный навык не получает publisher-доступа. GitHub push не меняет runtime получателей.
 
 ## Лицензия
 
-[CC BY 4.0](../LICENSE). При использовании и переработке укажите автора — **Виктор Филатов** — и ссылку на источник: https://github.com/smalever/public-files
+[CC BY 4.0](../LICENSE). Автор исходного набора — **Виктор Филатов**. Источник: https://github.com/smalever/public-files. При переработке сохраняйте атрибуцию.

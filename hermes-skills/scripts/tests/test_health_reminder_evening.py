@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPTS = Path("/opt/data/scripts")
+if not SCRIPTS.exists():
+    SCRIPTS = Path(__file__).resolve().parents[1]
 MSK = timezone(timedelta(hours=3))
 
 

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 """Morning health reminder data fetcher. Called by cron job."""
-# Run under the scripts venv, not Hermes' interpreter (cron ignores the shebang).
-import os as _os, sys as _sys
-_VENV = "/opt/data/home/.venv"
-if _os.path.realpath(_sys.prefix) != _os.path.realpath(_VENV) and _os.path.exists(_VENV + "/bin/python"):
-    for _k in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
-        _os.environ.pop(_k, None)
-    _os.execv(_VENV + "/bin/python", [_VENV + "/bin/python", _os.path.abspath(__file__), *_sys.argv[1:]])
 import json, os, sqlite3, sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path

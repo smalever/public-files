@@ -25,14 +25,22 @@ SLOT_TITLES = {
     "lunch_evening": "💊 Прими дневные и вечерние лекарства:",
 }
 
-def get_health_conn():
-    conn = sqlite3.connect(str(HEALTH_DB_PATH), timeout=20.0)
+def get_health_conn(*, write=False):
+    try:
+        conn = sqlite3.connect(Path(HEALTH_DB_PATH).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro'), uri=True, timeout=20.0)
+    except sqlite3.OperationalError as exc:
+        raise sqlite3.OperationalError('Cannot open existing health database; initialization must be a separate explicit operation.') from exc
     conn.row_factory = sqlite3.Row
-    init_db(conn)
+    try:
+        for table in ('medication_slot_log', 'med_intake_log'):
+            conn.execute(f'SELECT * FROM {table} LIMIT 0')
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise sqlite3.OperationalError('Missing/invalid medication tracking schema; run medication_reminder_helper.py migrate explicitly before use.') from exc
     return conn
 
 def init_db(conn: sqlite3.Connection):
-    """Ensures medication_slot_log table exists."""
+    """Explicit migration only; never called by read or intake operations."""
     with conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS medication_slot_log (
@@ -157,19 +165,13 @@ def get_active_meds_for_slot(slot: str, date_str: str = None):
             "note": note,
             "food": normalize_food_timing(r["food"] if food_col else None, note),
         }
-        if slot == "morning":
-            if "morning" in when:
-                if "wednesday" in when:
-                    if is_wednesday:
-                        res.append(med)
-                else:
-                    res.append(med)
-        elif slot == "lunch":
-            if "lunch" in when:
-                res.append(med)
-        elif slot == "evening":
-            if "evening" in when:
-                res.append(med)
+        atoms = when.replace("wednesday_morning", "weekly").split("_")
+        slots = {"wednesday_morning" if atom == "weekly" else atom for atom in atoms}
+        if slots - {"morning", "lunch", "evening", "wednesday_morning"}:
+            continue
+        if slot in SLOTS and (slot in slots or
+                (slot == "morning" and is_wednesday and "wednesday_morning" in slots)):
+            res.append(med)
 
     return res
 
@@ -247,7 +249,7 @@ def get_medication_catalog() -> list:
             "condition": str(m.get("condition", "") or "").strip() or None,
         })
 
-    if section:
+    if isinstance(section, dict):
         for slot in CATALOG_SLOT_ORDER:
             for m in section.get(slot) or []:
                 add(m.get("name"), slot, m)
@@ -258,11 +260,30 @@ def get_medication_catalog() -> list:
     else:
         conn = get_health_conn()
         try:
-            for r in conn.execute("SELECT name, dosage, when_text, note FROM medications WHERE active = 1"):
-                when = (r["when_text"] or "").lower()
-                for slot in ("morning", "wednesday_morning", "lunch", "evening"):
-                    if slot.split("_")[-1] in when or slot in when:
-                        add(r["name"], slot, {"dosage": r["dosage"], "note": r["note"]})
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(medications)")}
+            optional = ", food" if "food" in cols else ""
+            optional += ", timing" if "timing" in cols else ""
+            for r in conn.execute(f"SELECT name, dosage, when_text, note{optional} FROM medications WHERE active = 1"):
+                # Protect the weekly atom before decoding legacy underscore combinations.
+                when = (r["when_text"] or "").strip().casefold()
+                atoms = when.replace("wednesday_morning", "weekly").split("_")
+                slots = ["wednesday_morning" if atom == "weekly" else atom for atom in atoms]
+                if any(s not in CATALOG_SLOT_ORDER for s in slots):
+                    continue
+                times = []
+                if "timing" in cols:
+                    try:
+                        times = json.loads(r["timing"] or "[]")
+                    except (ValueError, TypeError):
+                        times = []
+                if not isinstance(times, list) or any(not isinstance(t, str) for t in times):
+                    times = []
+                # Combined legacy rows have no reliable time-to-slot mapping: do not invent one.
+                medication = {"dosage": r["dosage"], "note": r["note"],
+                    "food": r["food"] if "food" in cols else None}
+                for slot in dict.fromkeys(slots):
+                    for at in times or [None]:
+                        add(r["name"], slot, dict(medication, time=at))
         finally:
             conn.close()
     return list(catalog.values())
@@ -451,13 +472,26 @@ def mark_meds_taken(
     to_mark = [m for m in targets if not m["taken"]]
     already = [m for m in targets if m["taken"]]
 
-    conn = get_health_conn()
+    conn = get_health_conn(write=True)
     try:
         with conn:
-            medication_ids = {
-                (row["name"] or "").casefold(): row["id"]
-                for row in conn.execute("SELECT id, name FROM medications")
-            }
+            medication_rows = conn.execute(
+                "SELECT id, name, dosage, when_text FROM medications WHERE active = 1"
+            ).fetchall()
+            medication_ids = {}
+            for m in to_mark:
+                candidates = [r for r in medication_rows
+                              if med_key(r["name"]) == med_key(m["name"])
+                              and slot in (r["when_text"] or "").casefold()
+                              and ("wednesday" not in (r["when_text"] or "").casefold()
+                                   or datetime.strptime(date_str, "%Y-%m-%d").weekday() == 2)]
+                candidates.sort(key=lambda r: (
+                    (r["dosage"] or "") != (m.get("dosage") or ""),
+                    (r["when_text"] or "").casefold() != slot,
+                    str(r["id"]),
+                ))
+                if candidates:
+                    medication_ids[med_key(m["name"])] = candidates[0]["id"]
             marked = []
             for m in to_mark:
                 cur = conn.execute("""
@@ -534,9 +568,9 @@ def build_slot_confirmation_payload(slot: str, date_str: str, created) -> dict:
         res = created
         parts = []
         if res["marked"]:
-            parts.append("Отмечено: " + ", ".join(res["marked"]) + ".")
+            parts.append("Отмечено (" + SLOT_NAMES_RU.get(slot, slot) + "): " + ", ".join(res["marked"]) + ".")
         if res["already"]:
-            parts.append("Уже было отмечено: " + ", ".join(res["already"]) + ".")
+            parts.append("Уже было отмечено (" + SLOT_NAMES_RU.get(slot, slot) + "): " + ", ".join(res["already"]) + ".")
         if res["unknown"]:
             parts.append("Не нашёл в слоте «" + SLOT_NAMES_RU.get(slot, slot) + "»: " + ", ".join(res["unknown"]) + ".")
         if res["remaining"]:
@@ -588,7 +622,8 @@ def take_meds(date_str: str = None, slot: str = None, names: list = None,
     - names пусто, slot задан → все препараты этого слота.
     - names заданы → только названные, В ЛЮБОЕ ВРЕМЯ суток, независимо от окна
       (например, утренний препарат, названный вечером, — запишется как утренний).
-      Без slot ищем в текущем и более ранних слотах, сначала среди ещё не принятых.
+      Без slot ищем в текущем и более ранних слотах; если совпало несколько слотов
+      (включая уже принятые), требуется явный slot, весь запрос остаётся без записи.
     """
     now_dt = now or datetime.now(MSK)
     date_str = date_str or now_dt.strftime("%Y-%m-%d")
@@ -620,6 +655,31 @@ def take_meds(date_str: str = None, slot: str = None, names: list = None,
         return _combine_payloads(date_str, payloads, [])
 
     slots = [slot] if slot else current_slot_order(now_dt)
+    # Resolve the entire request before any writes. Taken doses remain candidates:
+    # otherwise repeating the same confirmation silently consumes another dose.
+    if not slot:
+        ambiguous = {}
+        for q in names:
+            candidates = [
+                dict(m, slot=s, slot_ru=SLOT_NAMES_RU.get(s, s))
+                for s in slots for m in get_slot_status(s, date_str)
+                if med_matches(q, m["name"])
+            ]
+            if len({m["slot"] for m in candidates}) > 1:
+                ambiguous[q] = candidates
+        if ambiguous:
+            return {
+                "status": "requires_confirmation", "type": "meds_slot_ambiguous",
+                "date": date_str, "marked": [], "already": [], "unknown": [],
+                "slots": [], "remaining": {}, "candidates": ambiguous,
+                "message": "Уточни слот для препарата: " + "; ".join(
+                    q + " — " + ", ".join(
+                        m["slot_ru"] + (f" ({m['dosage']})" if m.get("dosage") else "")
+                        + (" — уже отмечено" if m["taken"] else "")
+                        for m in candidates
+                    ) for q, candidates in ambiguous.items()
+                ) + ". Ничего не записано; укажи --slot.",
+            }
     by_slot = {}
     unknown = []
     for q in names:
@@ -733,10 +793,11 @@ def determine_reminder(date_str: str, current_msk_dt: datetime, meals_count_toda
         if slot_pending:
             slots_with_pending.append(s)
         for m in slot_pending:
-            if med_key(m["name"]) in seen:
+            dose_key = (s, med_key(m["name"]), m.get("food"), m.get("dosage"))
+            if dose_key in seen:
                 continue
-            seen.add(med_key(m["name"]))
-            pending.append(m)
+            seen.add(dose_key)
+            pending.append(dict(m, slot=s))
 
     meal_meds = [m for m in pending if m["food"] in MEAL_FOOD_TIMINGS]
     if not meal_meds:
@@ -756,24 +817,17 @@ def determine_reminder(date_str: str, current_msk_dt: datetime, meals_count_toda
 #  - Магний: «рекомендуется во время еды» → хоть какая-то еда.
 #  - Остальные препараты: требований к еде нет → не проверяем.
 MEAL_WINDOW_MINUTES = 60          # еда, записанная за последние N минут, считается одним приёмом
-MEAL_MIN_KCAL = 200.0             # Метформин: «настоящая еда», а не кофе
-FAT_MIN_FAT = 10.0                # Омега-3 / Q10: жиры, г
-FOOD_MIN_KCAL = 100.0             # Магний: минимум калорий
+# По умолчанию персональные эвристики отключены (возвращаются только факты из схемы).
+# При необходимости настраиваемые правила могут быть заданы через словарь FOOD_RULES.
+MEAL_MIN_KCAL = 200.0
+FAT_MIN_FAT = 10.0
+FOOD_MIN_KCAL = 100.0
 
 _MEAL = {"req": "meal"}
 _FAT = {"req": "fat"}
 _FOOD = {"req": "food"}
 
-FOOD_RULES = {
-    "омакор": _FAT,
-    "омега-3": _FAT,
-    "coq10": _FAT,
-    "коэнзим": _FAT,
-    "сиофор": _MEAL,
-    "глюкофаж": _MEAL,
-    "метформин": _MEAL,
-    "магни": _FOOD,
-}
+FOOD_RULES = {}
 
 
 def check_meal_requirement(req: str, meal_info: dict) -> list:
@@ -824,11 +878,11 @@ def _med_line(m: dict) -> str:
     line = f"- {m['name']}"
     if m.get("dosage"):
         line += f" ({m['dosage']})"
+    if m.get("slot"):
+        line += " — " + SLOT_NAMES_RU.get(m["slot"], m["slot"])
     tag = FOOD_TIMING_TAGS.get(m.get("food"))
     if tag:
         line += f" [{tag}]"
-    if m.get("note") and "по средам" in m["note"]:
-        line += " — подкожно"
     return line
 
 
@@ -841,8 +895,21 @@ def format_reminder(slot: str, meds: list, meal_info: dict = None) -> str:
 
     if before:
         lines.append("")
-        lines.append("⏰ До еды, ещё не отмечено: " + ", ".join(med_short_name(m["name"]) for m in before)
+        lines.append("⏰ До еды, ещё не отмечено: " + ", ".join(_med_line(m)[2:] for m in before)
                      + ". Если выпил — скажи, отмечу.")
+
+    if meal_info:
+        p = float(meal_info.get("protein") or 0)
+        f = float(meal_info.get("fat") or 0)
+        c = float(meal_info.get("carbs") or 0)
+        kcal = float(meal_info.get("kcal") or 0)
+        window = meal_info.get("window_minutes")
+        n = meal_info.get("meals_in_window")
+        scope = "в этом приёме"
+        if window and n and n > 1:
+            scope = f"за последние {window} мин ({n} записи)"
+        lines.append("")
+        lines.append(f"🍽 Съедено {scope}: {kcal:.0f} ккал — Б {p:.1f} / Ж {f:.1f} / У {c:.1f} г")
 
     checked = []
     for m in meal_meds:
@@ -858,17 +925,6 @@ def format_reminder(slot: str, meds: list, meal_info: dict = None) -> str:
         for name, r in checked:
             lines.append(f"• {name}: {_REQ_HINT[r['req']]}.")
         return "\n".join(lines)
-
-    p = float(meal_info.get("protein") or 0)
-    f = float(meal_info.get("fat") or 0)
-    c = float(meal_info.get("carbs") or 0)
-    kcal = float(meal_info.get("kcal") or 0)
-    window = meal_info.get("window_minutes")
-    n = meal_info.get("meals_in_window")
-    scope = "в этом приёме"
-    if window and n and n > 1:
-        scope = f"за последние {window} мин ({n} записи)"
-    lines.append(f"🍽 Съедено {scope}: {kcal:.0f} ккал — Б {p:.1f} / Ж {f:.1f} / У {c:.1f} г")
 
     notes = []
     for name, r in checked:
@@ -940,3 +996,15 @@ def calculate_weekly_adherence(start_date: str, end_date: str) -> dict:
         "missed_list": missed_list,
         "message": msg
     }
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Explicit medication tracking schema migration (existing health database only).')
+    parser.add_argument('command', choices=['migrate'])
+    parser.parse_args()
+    conn = sqlite3.connect(Path(HEALTH_DB_PATH).resolve().as_uri() + '?mode=rw', uri=True)
+    try:
+        init_db(conn)
+    finally:
+        conn.close()

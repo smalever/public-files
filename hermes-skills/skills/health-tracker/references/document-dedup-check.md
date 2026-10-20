@@ -6,17 +6,17 @@
 
 1. `documents.path` — совпадение по полному пути.
 2. Фрагменты имени файла / даты / номера протокола в `documents.path`.
-3. Если точного совпадения нет — сравнить **содержимое PDF**.
+3. Если точного совпадения нет — сравнить **содержимое PDF** (нормализованный текст и бинарный хеш исходного файла).
 
 ## Практика
 
-- Извлекать текст всех страниц PDF.
+- Извлекать текст всех страниц PDF через `pymupdf` (не устаревший `fitz`).
 - Нормализовать пробелы:
   - заменить `\s+` на один пробел
   - `strip()`
 - Сравнивать:
-  - полный нормализованный текст
-  - SHA-256 от нормализованного текста
+  - полный нормализованный текст и SHA-256 от нормализованного текста
+  - бинарный SHA-256 файла против файлов в `/opt/data/personal/health/documents/`
 
 Если hash и текст совпадают — это тот же документ, даже если имя файла другое.
 
@@ -27,25 +27,31 @@
 
 ## Полезный SQL
 
+> ⚠️ В таблице `documents` столбец называется `report_date`, а в `doctor_notes` — `date` (не `report_date`).
+
 ```sql
 SELECT id, report_date, lab_name, path, uploaded_at
 FROM documents
 WHERE path LIKE '%Протокол%' OR path LIKE '%consultation%' OR path LIKE '%protocol%'
 ORDER BY id DESC;
+
+SELECT id, date, doctor_name, specialization, substr(conclusion, 1, 80)
+FROM doctor_notes
+ORDER BY id DESC LIMIT 5;
 ```
 
 ## Полезная проверка текста
 
 ```python
-import fitz, re, hashlib
+import pymupdf, re, hashlib
 
 def normalized_pdf_text(path: str) -> str:
-    doc = fitz.open(path)
-    text = "\n".join(page.get_text('text') for page in doc)
-    return re.sub(r'\s+', ' ', text).strip()
+    doc = pymupdf.open(path)
+    text = "\n".join(page.get_text("text") for page in doc)
+    return re.sub(r"\s+", " ", text).strip()
 
 text = normalized_pdf_text(pdf_path)
-print(hashlib.sha256(text.encode()).hexdigest())
+print("Norm SHA-256:", hashlib.sha256(text.encode("utf-8")).hexdigest())
 ```
 
 ## Сигнал для ответа пользователю

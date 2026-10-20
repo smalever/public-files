@@ -5,7 +5,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HELPER_PATH = Path("/opt/data/scripts/medication_reminder_helper.py")
+if not HELPER_PATH.exists():
+    HELPER_PATH = Path(__file__).resolve().parents[1] / "medication_reminder_helper.py"
 NUTRITION_PATH = Path("/opt/data/skills-custom/health/nutrition/scripts/nutrition.py")
+if not NUTRITION_PATH.exists():
+    NUTRITION_PATH = Path(__file__).resolve().parents[2] / "skills/nutrition/scripts/nutrition.py"
 MSK = timezone(timedelta(hours=3))
 
 
@@ -16,10 +20,16 @@ def load(path, name):
     return m
 
 
-EVENING = [
-    {"name": "Лозартан", "dosage": "5 мг", "note": ""},
-    {"name": "Метформин (Глюкофаж)", "dosage": "1000 мг", "note": "во время ужина"},
-    {"name": "Магния цитрат (+ B6)", "dosage": "3 капсулы", "note": ""},
+BACKUP_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "skills/health-tracker/scripts/backup.py"
+
+NEUTRAL_MEDS_EVENING = [
+    {"name": "Препарат А", "dosage": "1 таб", "food": "with", "note": ""},
+    {"name": "Препарат Б", "dosage": "2 капс", "food": "after", "note": ""},
+]
+
+NEUTRAL_MEDS_MORNING = [
+    {"name": "Препарат до еды", "dosage": "1 таб", "food": "before", "note": ""},
+    {"name": "Препарат с едой", "dosage": "1 таб", "food": "with", "note": ""},
 ]
 
 
@@ -28,41 +38,46 @@ class FoodRulesTests(unittest.TestCase):
     def setUpClass(cls):
         cls.h = load(HELPER_PATH, "mrh_food_test")
 
-    def test_baked_apples_ok_for_metformin_no_scare(self):
-        info = {"kcal": 319, "protein": 1.8, "fat": 1.8, "carbs": 72.0}
-        text = self.h.format_reminder("evening", EVENING, meal_info=info)
-        self.assertNotIn("⚠️", text)
-        self.assertNotIn("не пей", text)
-        self.assertIn("✅ Еда подходит под все препараты", text)
+    def test_food_rules_disabled_by_default(self):
+        """Heuristics must be disabled by default; FOOD_RULES must be empty."""
+        self.assertEqual(self.h.FOOD_RULES, {})
 
-    def test_coffee_soft_hints_only_for_present_meds(self):
-        morning = [
-            {"name": "Витамин D3 + K2 (Бренд)", "dosage": "2 капсулы", "note": "", "food": "with"},
-            {"name": "Омега-3 (Бренд)", "dosage": "1 капсула", "note": "", "food": "with"},
-        ]
-        info = {"kcal": 57, "protein": 3.3, "fat": 2.7, "carbs": 5.1}
-        text = self.h.format_reminder("morning", morning, meal_info=info)
-        self.assertIn("💡 Омега-3: усвоится лучше", text)
-        self.assertNotIn("Витамин D3 + K2:", text)
-        self.assertNotIn("Магни", text)
-        self.assertNotIn("⚠️", text)
+    def test_reminder_returns_food_facts_from_schema_without_threshold_heuristics(self):
+        """Format reminder returns schema facts and meal totals without arbitrary thresholds."""
+        info = {"kcal": 50, "protein": 2.0, "fat": 1.0, "carbs": 8.0}
+        text = self.h.format_reminder("evening", NEUTRAL_MEDS_EVENING, meal_info=info)
+        self.assertIn("Препарат А (1 таб) [🍽 во время еды]", text)
+        self.assertIn("Препарат Б (2 капс) [🍽 после еды]", text)
+        self.assertIn("🍽 Съедено в этом приёме: 50 ккал — Б 2.0 / Ж 1.0 / У 8.0 г", text)
+        self.assertNotIn("💡", text)
+        self.assertNotIn("лучше от", text)
+        self.assertNotIn("✅ Еда подходит", text)
 
-    def test_normal_dinner_passes(self):
-        info = {"kcal": 550, "protein": 35, "fat": 20, "carbs": 50}
-        text = self.h.format_reminder("evening", EVENING, meal_info=info)
-        self.assertIn("✅ Еда подходит под все препараты", text)
+    def test_reminder_with_before_meds_shows_schema_facts(self):
+        text = self.h.format_reminder("morning", NEUTRAL_MEDS_MORNING)
+        self.assertIn("⏰ До еды, ещё не отмечено: Препарат до еды", text)
+        self.assertIn("- Препарат с едой (1 таб) [🍽 во время еды]", text)
 
-    def test_meal_rule(self):
-        self.assertTrue(self.h.check_meal_requirement("meal", {"kcal": 150}))
-        self.assertFalse(self.h.check_meal_requirement("meal", {"kcal": 200}))
+    def test_no_subcutaneous_heuristic_on_wednesday_note(self):
+        """Notes mentioning 'по средам' must not assume subcutaneous injection."""
+        meds = [{"name": "Тестовая добавка", "dosage": "1 капс", "note": "по средам", "food": "any"}]
+        text = self.h.format_reminder("morning", meds)
+        self.assertNotIn("подкожно", text)
 
-    def test_fat_rule(self):
-        self.assertTrue(self.h.check_meal_requirement("fat", {"fat": 9.9}))
-        self.assertFalse(self.h.check_meal_requirement("fat", {"fat": 10}))
 
-    def test_food_rule(self):
-        self.assertTrue(self.h.check_meal_requirement("food", {"kcal": 60}))
-        self.assertFalse(self.h.check_meal_requirement("food", {"kcal": 100}))
+class UnsafeBackupDisabledTests(unittest.TestCase):
+    def test_backup_fails_closed_without_copying_db(self):
+        """backup.py must fail-closed with admin guidance and never copy live SQLite db."""
+        import subprocess
+        result = subprocess.run(
+            ["/home/sma/.venv/bin/python", str(BACKUP_SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        output = (result.stdout + result.stderr).lower()
+        self.assertIn("disabled", output)
+        self.assertNotIn("backup created", output)
 
 
 class WindowTotalsTests(unittest.TestCase):

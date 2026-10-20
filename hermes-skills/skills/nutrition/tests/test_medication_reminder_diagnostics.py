@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 
 NUTRITION_PATH = Path("/opt/data/skills-custom/health/nutrition/scripts/nutrition.py")
+if not NUTRITION_PATH.exists():
+    NUTRITION_PATH = Path(__file__).resolve().parents[1] / "scripts" / "nutrition.py"
 MSK = timezone(timedelta(hours=3))
 
 

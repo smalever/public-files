@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 SCRIPT_PATH = Path("/opt/data/scripts/recipe_context.py")
+if not SCRIPT_PATH.exists():
+    SCRIPT_PATH = Path(__file__).resolve().parents[1] / "recipe_context.py"
 
 
 def load_module():
@@ -190,7 +192,10 @@ nutrition_week:
 
 class WeeklyNoteContractTests(unittest.TestCase):
     def test_weekly_note_contains_carbs_and_logging_coverage(self):
-        source = Path("/opt/data/scripts/health_weekly_review.py").read_text(encoding="utf-8")
+        hw_path = Path("/opt/data/scripts/health_weekly_review.py")
+        if not hw_path.exists():
+            hw_path = Path(__file__).resolve().parents[1] / "health_weekly_review.py"
+        source = hw_path.read_text(encoding="utf-8")
         self.assertIn('("Углеводы"', source)
         self.assertIn("Дней с записями", source)
         self.assertIn("nutrition_week:", source)

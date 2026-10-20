@@ -17,8 +17,11 @@ DB = Path("/opt/data/personal/finance/finance.db")
 
 
 
-def get_conn():
-    conn = sqlite3.connect(DB)
+def get_conn(*, write=False):
+    try:
+        conn = sqlite3.connect(Path(DB).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro'), uri=True)
+    except sqlite3.OperationalError as exc:
+        raise sqlite3.OperationalError('Cannot open existing finance database; initialization must be a separate explicit operation.') from exc
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -148,6 +151,19 @@ def cmd_list(args):
     c.execute(query, params)
     rows = c.fetchall()
 
+    if getattr(args, "summary", False):
+        has_records = len(rows) > 0
+        payload = {
+            "status": "ok",
+            "has_records": has_records,
+            "count": len(rows),
+            "from": args.from_,
+            "to": args.to,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        conn.close()
+        return
+
     if args.json:
         result = []
         for r in rows:
@@ -227,7 +243,7 @@ def cmd_balance(args):
 
 
 def cmd_add(args):
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
 
     validate_category(conn, args.cat)
@@ -261,7 +277,7 @@ def cmd_add(args):
 
 
 def cmd_delete(args):
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
 
     if args.index:
@@ -364,7 +380,7 @@ def cmd_stats(args):
 
 
 def cmd_fuel_add(args):
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
 
     validate_account(conn, args.account)
@@ -565,6 +581,7 @@ def main():
     p_list.add_argument("--account", help="Фильтр по счёту")
     p_list.add_argument("--limit", type=int, help="Лимит записей")
     p_list.add_argument("--json", action="store_true", help="Вывод в JSON")
+    p_list.add_argument("--summary", action="store_true", help="Машинная сводка: has_records, count, status (без raw записей)")
 
     p_balance = subparsers.add_parser("balance", help="Баланс")
     p_balance.add_argument("--account", help="Баланс по конкретному счёту")
@@ -627,7 +644,11 @@ def main():
         "fuel-stats": cmd_fuel_stats,
     }
 
-    commands[args.command](args)
+    try:
+        commands[args.command](args)
+    except sqlite3.DatabaseError as exc:
+        print(json.dumps({'status': 'error', 'message': f'Database/schema error: {exc}. Schema changes require explicit initialization/migration.'}, ensure_ascii=False))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

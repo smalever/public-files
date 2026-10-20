@@ -11,11 +11,15 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 import difflib
+from pathlib import Path
 
 DB_PATH = '/opt/data/personal/health/health.db'
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+def get_conn(*, write=False):
+    try:
+        conn = sqlite3.connect(Path(DB_PATH).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro'), uri=True)
+    except sqlite3.OperationalError as exc:
+        raise sqlite3.OperationalError('Cannot open existing health database; initialization must be a separate explicit operation.') from exc
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -23,7 +27,7 @@ def find_closest_match(query, choices, cutoff=0.4, limit=5):
     return difflib.get_close_matches(query, choices, n=limit, cutoff=cutoff)
 
 def add_metric(args):
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
     msk_time = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     ts = msk_time.strftime('%d.%m.%Y %H:%M:%S')
@@ -59,8 +63,31 @@ def add_metric(args):
     conn.commit()
     conn.close()
 
+def _record_scheduled_medication(name, args, date, now):
+    """Route scheduled doses through the idempotent slot-aware writer."""
+    sys.path.append("/opt/data/scripts")
+    import medication_reminder_helper as med_helper
+    entry = next((e for e in med_helper.get_medication_catalog()
+                  if med_helper.med_key(e["name"]) == med_helper.med_key(name)), None)
+    if not entry or not any(s["slot"] != "as_needed" for s in entry["schedule"]):
+        return False
+    explicit_slot = getattr(args, "slot", None)
+    if not explicit_slot and getattr(args, "method", None) in med_helper.SLOTS:
+        explicit_slot = args.method
+    payload = med_helper.take_meds(
+        date_str=date, slot=explicit_slot, names=[entry["name"]],
+        confirmed_text="confirmed via health.py medication", now=now,
+    )
+    print(json.dumps(payload, ensure_ascii=False))
+    return True
+
+
 def add_medication(args):
-    conn = get_conn()
+    msk_time = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
+    date = args.date or msk_time.strftime('%Y-%m-%d')
+    if _record_scheduled_medication(args.name.strip(), args, date, msk_time):
+        return
+    conn = get_conn(write=True)
     c = conn.cursor()
     msk_time = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     ts = msk_time.strftime('%d.%m.%Y %H:%M:%S')
@@ -134,6 +161,9 @@ def add_medication(args):
                     sys.exit(0)
             else:
                 method = args.method
+    if exact and _record_scheduled_medication(med_name, args, date, msk_time):
+        conn.close()
+        return
     c.execute("INSERT INTO med_log (date, ts, medication, dosage, method, med_id) VALUES (?,?,?,?,?,?)",
               (date, ts, med_name, dosage, method, med_id))
     conn.commit()
@@ -146,8 +176,18 @@ def list_metrics(args):
     c = conn.cursor()
     c.execute("SELECT * FROM metrics WHERE date=? ORDER BY ts DESC", (args.date,))
     rows = c.fetchall()
-    for row in rows:
-        print(dict(row))
+    if getattr(args, 'summary', False) or getattr(args, 'json', False):
+        has_records = len(rows) > 0
+        payload = {
+            "status": "ok",
+            "has_records": has_records,
+            "count": len(rows),
+            "date": args.date,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(dict(row))
     conn.close()
 
 def take_meds_cmd(args):
@@ -216,14 +256,21 @@ def main():
     med_parser.add_argument('--name', required=True, help='Название лекарства')
     med_parser.add_argument('--dosage', help='Дозировка (если не указана, возмётся из справочника)')
     med_parser.add_argument('--method', help='Способ/время приёма (если не указано, возмётся из справочника)')
+    med_parser.add_argument('--slot', choices=['morning', 'lunch', 'evening'], help='Явный слот планового приёма')
     med_parser.add_argument('--date')
     med_parser.set_defaults(func=add_medication)
     list_parser = subparsers.add_parser('list', help='List metrics')
     list_parser.add_argument('--date', required=True)
+    list_parser.add_argument('--json', action='store_true', help='Вывод в JSON')
+    list_parser.add_argument('--summary', action='store_true', help='Машинная сводка: has_records, count, status (без raw записей)')
     list_parser.set_defaults(func=list_metrics)
     args = parser.parse_args()
     if args.command:
-        args.func(args)
+        try:
+            args.func(args)
+        except sqlite3.DatabaseError as exc:
+            print(json.dumps({'status': 'error', 'message': f'Database/schema error: {exc}. Schema changes require explicit initialization/migration.'}, ensure_ascii=False))
+            sys.exit(1)
     else:
         parser.print_help()
 

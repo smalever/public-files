@@ -8,6 +8,8 @@ from pathlib import Path
 
 
 HELPER_PATH = Path("/opt/data/scripts/medication_reminder_helper.py")
+if not HELPER_PATH.exists():
+    HELPER_PATH = Path(__file__).resolve().parents[1] / "medication_reminder_helper.py"
 
 
 def load_helper():
@@ -65,6 +67,8 @@ medications:
         self.helper = load_helper()
         self.helper.HEALTH_DB_PATH = self.db_path
         self.helper.MEDS_NOTE_PATH = self.note_path
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.helper.init_db(conn)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -178,13 +182,15 @@ medications:
         with closing(sqlite3.connect(self.db_path)) as conn:
             conn.executescript("""
                 CREATE TABLE medications (id TEXT PRIMARY KEY, name TEXT NOT NULL, dosage TEXT,
-                    frequency TEXT, timing TEXT, when_text TEXT, note TEXT, active BOOLEAN DEFAULT 1, added DATE);
+                    frequency TEXT, timing TEXT, when_text TEXT, note TEXT, food TEXT, active BOOLEAN DEFAULT 1, added DATE);
                 CREATE TABLE med_log (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, ts TEXT NOT NULL,
                     medication TEXT NOT NULL, dosage TEXT, method TEXT, med_id TEXT);
             """)
         self.h = load_helper()
         self.h.HEALTH_DB_PATH = self.db_path
         self.h.MEDS_NOTE_PATH = note
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.h.init_db(conn)
         self.d = "2026-09-22"
         self.msk = timezone(timedelta(hours=3))
 
@@ -476,7 +482,10 @@ medications:
 
     def test_sync_timing_comes_only_from_scheme(self):
         import json as _json
-        spec = importlib.util.spec_from_file_location("health_sync_test", "/opt/data/scripts/health_sync.py")
+        hs_path = Path("/opt/data/scripts/health_sync.py")
+        if not hs_path.exists():
+            hs_path = Path(__file__).resolve().parents[1] / "health_sync.py"
+        spec = importlib.util.spec_from_file_location("health_sync_test", str(hs_path))
         hs = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hs)
         note = self.NOTE.replace('dosage: "1000 мг"\n', 'dosage: "1000 мг"\n      time: "20:00"\n', 1)

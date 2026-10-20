@@ -9,12 +9,17 @@ import json
 import os
 import sys
 import re
+import math
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 DB_PATH = '/opt/data/personal/nutrition/nutrition.db'
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+def get_conn(*, write=False):
+    try:
+        conn = sqlite3.connect(Path(DB_PATH).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro'), uri=True)
+    except sqlite3.OperationalError as exc:
+        raise sqlite3.OperationalError('Cannot open existing nutrition database; initialization must be a separate explicit operation.') from exc
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -205,38 +210,43 @@ def window_meal_totals(c, now_msk, window_minutes=60):
 
 
 def add_meal(args):
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
     msk_time = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     ts = msk_time.strftime('%d.%m.%Y %H:%M:%S')
     date = args.date or msk_time.strftime('%Y-%m-%d')
 
     items = []
-    if ';' in args.items:
-        print(json.dumps({
-            "status": "error",
-            "type": "bad_items_format",
-            "message": "Используй запятые для разделения продуктов, не ';'. Формат: продукт 100г, продукт 200г"
-        }, ensure_ascii=False))
-        conn.close()
-        return
-
-    # Используем regex findall вместо split, чтобы запятые в числах (2,5%)
-    # и разделителях не ломали парсинг. Ищем паттерн "название число + г".
-    matches = re.findall(r'(.+?)\s+(\d+(?:[.,]\d+)?)\s*г', args.items)
-    for match in matches:
-        product = match[0].strip(' ,')
-        grams = float(match[1].replace(',', '.'))
+    remaining = args.items.strip()
+    valid = bool(remaining) and ';' not in remaining
+    # Commas inside product names (e.g. 2,5%) are not item delimiters.
+    pattern = re.compile(r'([^,]+(?:,(?=\d)[^,]+)*?)\s+(\d+(?:[.,]\d+)?)\s*г(?=\s*(?:,|$))')
+    while valid and remaining:
+        match = pattern.match(remaining)
+        if not match:
+            valid = False
+            break
+        product = match[1].strip()
+        grams = float(match[2].replace(',', '.'))
+        if not product or re.search(r'\d\s*г(?:\s|$)', product) or not math.isfinite(grams) or grams <= 0:
+            valid = False
+            break
         items.append({'product': product, 'grams': grams})
-
-    if not items:
-        print("Не удалось распознать продукты.")
+        remaining = remaining[match.end():].strip()
+        if remaining:
+            remaining = remaining[1:].strip()
+            if not remaining:
+                valid = False
+    if not valid:
+        print(json.dumps(dict(status='error', type='bad_items_format', saved=False, verified=False,
+                              message='Формат: продукт 100г, продукт 200г; вес должен быть конечным и больше нуля.'),
+                         ensure_ascii=False))
         conn.close()
         return
 
     total_kcal, total_p, total_f, total_c = 0, 0, 0, 0
     nutrition_items = []
-    not_found_products = []
+    problems = []
 
     for item in items:
         search = item['product']
@@ -244,21 +254,14 @@ def add_meal(args):
 
         if rows:
             row = rows[0]
-            if len(rows) > 1:
-                variants = ', '.join(dict(r)['product'] for r in rows[:5])
-                print(json.dumps({
-                    "status": "warning", "type": "multiple_matches",
-                    "product": search,
-                    "message": f"Найдено несколько вариантов для '{search}': {variants}. Выбран: {row['product']}"
-                }, ensure_ascii=False))
-            elif match_type in ('fuzzy', 'fuzzy_alias', 'similar', 'similar_alias'):
-                print(json.dumps({
-                    "status": "warning", "type": "fuzzy_match",
-                    "product": search,
-                    "selected": row['product'],
-                    "match_type": match_type,
-                    "message": f"Продукт '{search}' не найден точно. Подобран: '{row['product']}'"
-                }, ensure_ascii=False))
+            if len(rows) > 1 or match_type not in ('exact', 'alias'):
+                problems.append({
+                    'type': 'multiple_matches' if len(rows) > 1 else 'fuzzy_match',
+                    'product': search, 'grams': item['grams'],
+                    'candidates': [r['product'] for r in rows], 'match_type': match_type,
+                    'message': f"Уточни продукт '{search}'; весь приём пищи не сохранён."
+                })
+                continue
             kcal_100, p_100, f_100, c_100 = row['kcal'], row['protein'], row['fat'], row['carbs']
             ratio = item['grams'] / 100.0
             kcal = int(kcal_100 * ratio)
@@ -276,27 +279,32 @@ def add_meal(args):
                 'kcal': kcal, 'protein': p, 'fat': f, 'carbs': c_val
             })
         else:
-            # Ничего не найдено — ищем похожие для подсказки
             suggestions = _find_suggestions(c, search)
-            not_found_products.append({
-                'product': item['product'],
-                'grams': item['grams'],
-                'suggestions': suggestions
+            problems.append({
+                'type': 'product_not_found', 'product': search, 'grams': item['grams'],
+                'suggestions': suggestions,
+                'message': f"Продукт '{search}' не найден в базе."
             })
 
-    if not_found_products:
-        for item in not_found_products:
-            msg = f"Продукт '{item['product']}' не найден в базе."
-            if item['suggestions']:
-                variants = ', '.join(item['suggestions'][:5])
-                msg += f" Похожие: {variants}"
-            print(json.dumps({
-                "status": "error", "type": "product_not_found",
-                "product": item['product'], "grams": item['grams'],
-                "suggestions": item['suggestions'],
-                "message": msg
-            }, ensure_ascii=False))
+    if problems:
+        payload = dict(problems[0], status='warning' if problems[0]['type'] != 'product_not_found' else 'error',
+                       saved=False, verified=False, requires_confirmation=True, problems=problems)
+        print(json.dumps(payload, ensure_ascii=False))
         conn.close()
+        return
+
+    # Serialize duplicate check with the write, including competing CLI invocations.
+    c.execute('BEGIN IMMEDIATE')
+    existing = c.execute('SELECT id FROM nutrition WHERE date=? AND meal=? ORDER BY id',
+                         (date, args.meal)).fetchall()
+    if args.meal != 'snack' and existing and not getattr(args, 'allow_additional', False):
+        conn.rollback()
+        conn.close()
+        print(json.dumps(dict(status='warning', type='additional_meal_confirmation',
+                              saved=False, verified=False, requires_confirmation=True,
+                              date=date, meal=args.meal, existing_ids=[r['id'] for r in existing],
+                              message='Основной приём уже записан; после подтверждения используй --allow-additional.'),
+                         ensure_ascii=False))
         return
 
     c.execute("INSERT INTO nutrition (date, ts, meal, total_kcal, total_protein, total_fat, total_carbs) VALUES (?,?,?,?,?,?,?)",
@@ -317,12 +325,40 @@ def add_meal(args):
             print(f"⚠️ Не удалось посчитать еду за последний час: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
     conn.close()
-    print(f"Прием пищи '{args.meal}' записан. Калории: {total_kcal}")
+    totals = dict(kcal=total_kcal, protein=total_p, fat=total_f, carbs=total_c)
+    receipt = dict(id=nutrition_id, date=date, ts=ts, meal=args.meal,
+                   items=nutrition_items, totals=totals, medication_reminder=None)
+    verification_conn = None
+    try:
+        verification_conn = get_conn()
+        parent = verification_conn.execute(
+            'SELECT date, ts, meal, total_kcal, total_protein, total_fat, total_carbs FROM nutrition WHERE id=?',
+            (nutrition_id,),
+        ).fetchone()
+        expected_parent = (date, ts, args.meal, total_kcal, total_p, total_f, total_c)
+        actual_items = verification_conn.execute(
+            'SELECT product, grams, kcal, protein, fat, carbs FROM nutrition_items WHERE nutrition_id=? ORDER BY id',
+            (nutrition_id,),
+        ).fetchall()
+        expected_items = [tuple(item[k] for k in ('product', 'grams', 'kcal', 'protein', 'fat', 'carbs'))
+                          for item in nutrition_items]
+        if parent is None or tuple(parent) != expected_parent or [tuple(r) for r in actual_items] != expected_items:
+            raise ValueError('Committed meal readback does not match expected parent/items')
+    except Exception as exc:
+        print(json.dumps(dict(receipt, status='error', saved=True, verified=False,
+                              type='verification_failed', error=f'{type(exc).__name__}: {exc}',
+                              message='Запись сохранена, но не подтверждена; не повторяй запись автоматически.'),
+                         ensure_ascii=False))
+        return
+    finally:
+        if verification_conn is not None:
+            verification_conn.close()
 
     # Check medication reminder for the meal (only for today's meals).
     med_helper = load_medication_reminder_helper()
     msk_dt = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
     today_str = msk_dt.strftime("%Y-%m-%d")
+    reminder = None
     if med_helper is not None and date == today_str:
         meal_info = {
             "meal": args.meal,
@@ -342,6 +378,11 @@ def add_meal(args):
             total_meals_today=total_meals_today,
             meal_info=meal_info,
         )
+    if getattr(args, 'json', False):
+        receipt['medication_reminder'] = reminder
+        print(json.dumps(dict(receipt, status='ok', saved=True, verified=True), ensure_ascii=False))
+    else:
+        print(f"Прием пищи '{args.meal}' записан. Калории: {total_kcal}")
         if reminder:
             print()
             print(reminder)
@@ -393,7 +434,7 @@ def _find_suggestions(c, search, max_suggestions=5):
 
 def delete_meal(args):
     """Удаление приёма пищи по ID с предварительным показом."""
-    conn = get_conn()
+    conn = get_conn(write=True)
     c = conn.cursor()
 
     # Показываем запись перед удалением
@@ -458,6 +499,29 @@ def summary_meal(args):
             (start_str, end_str)
         ).fetchall()
 
+        if getattr(args, 'summary', False) or getattr(args, 'json', False):
+            has_records = len(rows) > 0
+            total_kcal = sum(r['kcal'] or 0 for r in rows) if has_records else 0.0
+            total_p = sum(r['p'] or 0 for r in rows) if has_records else 0.0
+            total_f = sum(r['f'] or 0 for r in rows) if has_records else 0.0
+            total_c = sum(r['c'] or 0 for r in rows) if has_records else 0.0
+            payload = {
+                "status": "ok",
+                "has_records": has_records,
+                "count": sum(r['meals_cnt'] or 0 for r in rows) if has_records else 0,
+                "days_count": len(rows),
+                "start_date": start_str,
+                "end_date": end_str,
+            }
+            if has_records:
+                payload["total_kcal"] = round(total_kcal, 1)
+                payload["total_protein"] = round(total_p, 1)
+                payload["total_fat"] = round(total_f, 1)
+                payload["total_carbs"] = round(total_c, 1)
+            print(json.dumps(payload, ensure_ascii=False))
+            conn.close()
+            return
+
         if not rows:
             print(f"Нет записей за период {start_str} — {end_str}.")
             conn.close()
@@ -483,6 +547,27 @@ def summary_meal(args):
             "FROM nutrition WHERE date = ? ORDER BY id ASC",
             (target_date,)
         ).fetchall()
+
+        if getattr(args, 'summary', False) or getattr(args, 'json', False):
+            has_records = len(rows) > 0
+            payload = {
+                "status": "ok",
+                "has_records": has_records,
+                "count": len(rows),
+                "date": target_date,
+            }
+            if has_records:
+                total_kcal = sum(r['total_kcal'] or 0 for r in rows)
+                total_p = sum(r['total_protein'] or 0 for r in rows)
+                total_f = sum(r['total_fat'] or 0 for r in rows)
+                total_c = sum(r['total_carbs'] or 0 for r in rows)
+                payload["total_kcal"] = round(total_kcal, 1)
+                payload["total_protein"] = round(total_p, 1)
+                payload["total_fat"] = round(total_f, 1)
+                payload["total_carbs"] = round(total_c, 1)
+            print(json.dumps(payload, ensure_ascii=False))
+            conn.close()
+            return
 
         if not rows:
             print(f"Нет записей за {target_date}.")
@@ -537,6 +622,8 @@ def main():
     meal_parser.add_argument('--meal', required=True, choices=['breakfast', 'lunch', 'dinner', 'snack'])
     meal_parser.add_argument('--items', required=True, help='e.g., "говядина 200г, гречка 150г"')
     meal_parser.add_argument('--date')
+    meal_parser.add_argument('--allow-additional', action='store_true', help='Explicitly confirmed additional main meal')
+    meal_parser.add_argument('--json', action='store_true', help='Verified machine receipt')
     meal_parser.set_defaults(func=add_meal)
 
     meds_parser = subparsers.add_parser('take-meds', help='Mark medications as taken')
@@ -553,11 +640,17 @@ def main():
     summary_parser = subparsers.add_parser('summary', help='Show nutrition summary')
     summary_parser.add_argument('--date', help='Date in YYYY-MM-DD format (default: today)')
     summary_parser.add_argument('--days', type=int, default=1, help='Number of days (default: 1)')
+    summary_parser.add_argument('--json', action='store_true', help='Вывод в JSON')
+    summary_parser.add_argument('--summary', action='store_true', help='Машинная сводка: has_records, count, status (без raw записей)')
     summary_parser.set_defaults(func=summary_meal)
 
     args = parser.parse_args()
     if args.command:
-        args.func(args)
+        try:
+            args.func(args)
+        except sqlite3.DatabaseError as exc:
+            print(json.dumps({'status': 'error', 'message': f'Database/schema error: {exc}. Schema changes require explicit initialization/migration.'}, ensure_ascii=False))
+            sys.exit(1)
     else:
         parser.print_help()
 

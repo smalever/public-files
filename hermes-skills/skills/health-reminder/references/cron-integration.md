@@ -19,4 +19,5 @@ hermes cron doctor
 
 ## Правила
 - Скрипты правим в `/opt/data/scripts/` (тесты — `/opt/data/scripts/tests/`).
-- Cron запускает `.py` интерпретатором Hermes; тяжёлые зависимости скрипты берут через re-exec в `/opt/data/home/.venv`.
+- Cron игнорирует shebang. У пяти health jobs задан `interpreter: /opt/data/home/.venv/bin/python`; шесть self-reexec блоков удалены. Общая справка: `/opt/data/home/python-runtime.md`.
+- Interpreter менять только штатным `hermes cron edit <id> --interpreter ...`, без ручной перезаписи `jobs.json` и без `cron run`. Прямой запуск через чужой Python больше не переключает окружение автоматически.

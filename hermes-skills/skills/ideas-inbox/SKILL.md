@@ -1,7 +1,7 @@
 ---
 name: ideas-inbox
 description: "Use when the owner says «запиши идею/мысль» — quick capture to /notes/Идеи."
-version: 2.1.0
+version: 2.1.1
 author: Viktor Filatov (smalever), Hermes Agent
 license: CC-BY-4.0
 metadata:
@@ -16,9 +16,11 @@ metadata:
 
 Use this skill to quickly capture raw ideas before they are lost. The goal is not to fully design or evaluate the idea, but to preserve it in a short, readable form so the user can return to it later.
 
-Destination: `/notes/Идеи/<Короткое название>.md`, then add one line `- [[<Название>]] — <суть>` to the matching section of `/notes/Идеи/Идеи.md`.
+Destination: `/notes/Идеи/<Короткое название>.md`, then add one line `- [[<Название>]] — <суть>` to the matching section of `/notes/Идеи/Идеи.md` (create a new logical heading if no existing section fits, e.g. `## Книги и чтение`).
 
 Vault mechanics (paths, file tools, wikilinks) — see the `obsidian` skill. Note template — `/notes/Шаблоны/Идея.md`.
+
+Before saving, load `notes-vault` and read `/notes/AGENTS.md`; preserve the vault's secret and protected-data constraints.
 
 ## When to Use
 
@@ -46,6 +48,7 @@ Do not use for:
 6. If the idea is already understandable, save it immediately without slowing the user down.
 7. If critical meaning is unclear, ask at most 1-2 short clarification questions.
 8. If the user does not answer or wants speed, save the note with neutral placeholders rather than blocking capture.
+9. If the user provides a link (book, article, tool, repo), fetch its title and summary via web reading tools to populate the core idea and `Что уже известно` accurately, keeping the original link in the note.
 
 ## Note Structure
 

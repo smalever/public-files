@@ -65,112 +65,69 @@ def sync_medications(conn: sqlite3.Connection):
     if not isinstance(obs_meds, dict):
         return None, "Секция 'medications' имеет неверный формат"
 
-    # Build flat list of all active medications from Obsidian
-    current_items = []
-    
-    # 1. morning
-    for m in obs_meds.get("morning", []):
-        current_items.append({
-            "name": m.get("name", "").strip(),
-            "dosage": m.get("dosage", "").strip(),
-            "timing": _timing_json(m),
-            "when_text": "morning",
-            "note": m.get("note", "утром"),
-            "food": m.get("food"),
-        })
-
-    # 2. lunch
-    for m in obs_meds.get("lunch", []):
-        current_items.append({
-            "name": m.get("name", "").strip(),
-            "dosage": m.get("dosage", "").strip(),
-            "timing": _timing_json(m),
-            "when_text": "lunch",
-            "note": m.get("note", "днём во время еды"),
-            "food": m.get("food"),
-        })
-
-    # 3. wednesday_morning
-    for m in obs_meds.get("wednesday_morning", []):
-        current_items.append({
-            "name": m.get("name", "").strip(),
-            "dosage": m.get("dosage", "").strip(),
-            "timing": _timing_json(m),
-            "when_text": "wednesday_morning",
-            "note": m.get("note", "по средам утром"),
-            "food": m.get("food"),
-        })
-
-    # 4. evening
-    for m in obs_meds.get("evening", []):
-        current_items.append({
-            "name": m.get("name", "").strip(),
-            "dosage": m.get("dosage", "").strip(),
-            "timing": _timing_json(m),
-            "when_text": "evening",
-            "note": m.get("note", "вечером"),
-            "food": m.get("food"),
-        })
-
-    # Handle duplicates across morning & evening (e.g. одна омега-3 утром и вечером → morning_evening)
-    merged_items = {}
-    for item in current_items:
-        name = item["name"]
-        if not name:
-            continue
-        key = name.lower()
-        if key in merged_items:
-            existing = merged_items[key]
-            # If present both morning and evening -> morning_evening
-            times = set(json.loads(existing["timing"]) + json.loads(item["timing"]))
-            existing["timing"] = json.dumps(sorted(list(times)))
-            if ("morning" in existing["when_text"] and "evening" in item["when_text"]) or \
-               ("evening" in existing["when_text"] and "morning" in item["when_text"]):
-                existing["when_text"] = "morning_evening"
-                existing["note"] = "утром и вечером"
-        else:
-            merged_items[key] = item
-
-    # Признак приёма относительно еды (before/with/after/any).
+    # One row per name + atomic slot; names are not unique in this schema.
+    defaults = {"morning": "утром", "lunch": "днём во время еды",
+                "wednesday_morning": "по средам утром", "evening": "вечером"}
+    # Validate the entire source before any SQL mutation, including ignored PRN entries.
+    for slot, entries in obs_meds.items():
+        if slot not in (*defaults, "as_needed") or not isinstance(entries, list):
+            return None, f"Некорректный слот medications.{slot}: ожидается список"
+        seen = set()
+        for m in entries:
+            if not isinstance(m, dict) or not isinstance(m.get("name"), str) or not m["name"].strip():
+                return None, f"Некорректный препарат в medications.{slot}"
+            key = m["name"].strip().casefold()
+            if key in seen:
+                return None, f"Повтор препарата в medications.{slot}: {m['name']}"
+            seen.add(key)
+            for field in ("dosage", "time", "note", "condition", "food"):
+                if field in m and not isinstance(m[field], str):
+                    return None, f"Некорректное поле {slot}.{field}: ожидается строка"
+            if m.get("food", "").strip().casefold() not in ("", "before", "with", "after", "any"):
+                return None, f"Некорректное значение food в medications.{slot}"
+    items = []
+    for slot, default_note in defaults.items():
+        for m in obs_meds.get(slot, []):
+            items.append(dict(name=m.get("name", "").strip(),
+                dosage=m.get("dosage", "").strip(), timing=_timing_json(m),
+                slot=slot, note=m.get("note", default_note), food=m.get("food")))
     cols = {r[1] for r in cur.execute("PRAGMA table_info(medications)")}
     if "food" not in cols:
-        cur.execute("ALTER TABLE medications ADD COLUMN food TEXT")
-    for item in merged_items.values():
-        f = str(item.get("food") or "").strip().casefold()
-        item["food"] = f if f in ("before", "with", "after", "any") else None
-
-    # Sync to SQLite
-    active_names = set(merged_items.keys())
+        raise sqlite3.OperationalError('Missing medications.food schema; run health_sync.py migrate explicitly before synchronization.')
+    rows = cur.execute("SELECT id,name,when_text,active FROM medications ORDER BY id").fetchall()
+    used, assignments = set(), {}
+    # First reserve exact matches, then retain a historical/combined ID on one row.
+    for exact in (True, False):
+        for i, item in enumerate(items):
+            if i in assignments:
+                continue
+            for row in rows:
+                if (row[0] not in used and row[1].strip().casefold() == item["name"].casefold()
+                        and (not exact or row[2] == item["slot"])):
+                    assignments[i] = row[0]
+                    used.add(row[0])
+                    break
     now_date = datetime.now(MSK).strftime("%Y-%m-%d")
-
-    # Read existing medications from DB
-    cur.execute("SELECT id, name, dosage, timing, when_text, note, active FROM medications")
-    db_rows = cur.fetchall()
-    db_map = {r[1].strip().lower(): r for r in db_rows}
-
-    # Update or insert active medications
-    for idx, (key, item) in enumerate(merged_items.items()):
-        if key in db_map:
-            db_row = db_map[key]
-            db_id = db_row[0]
-            cur.execute("""
-                UPDATE medications 
-                SET dosage = ?, timing = ?, when_text = ?, note = ?, food = ?, active = 1
-                WHERE id = ?
-            """, (item["dosage"], item["timing"], item["when_text"], item["note"], item["food"], db_id))
-        else:
-            new_id = f"med_obs_{int(time.time()*1000)}_{idx}"
-            cur.execute("""
-                INSERT INTO medications (id, name, dosage, frequency, timing, when_text, note, food, active, added)
-                VALUES (?, ?, ?, '1 раз в день', ?, ?, ?, ?, 1, ?)
-            """, (new_id, item["name"], item["dosage"], item["timing"], item["when_text"], item["note"], item["food"], now_date))
-
-    # Deactivate medications removed from Obsidian
-    for key, db_row in db_map.items():
-        if key not in active_names and db_row[6] == 1: # if was active
-            cur.execute("UPDATE medications SET active = 0 WHERE id = ?", (db_row[0],))
-
-    conn.commit()
+    cur.execute("SAVEPOINT medication_sync")
+    try:
+        for i, item in enumerate(items):
+            food = str(item["food"] or "").strip().casefold() or None
+            values = (item["name"], item["dosage"], item["timing"], item["slot"], item["note"], food)
+            if i in assignments:
+                cur.execute("""UPDATE medications SET name=?,dosage=?,timing=?,when_text=?,note=?,food=?,active=1
+                    WHERE id=?""", values + (assignments[i],))
+            else:
+                new_id = f"med_obs_{time.time_ns()}_{i}"
+                cur.execute("""INSERT INTO medications (name,dosage,timing,when_text,note,food,id,frequency,active,added)
+                    VALUES (?,?,?,?,?,?,?,'1 раз в день',1,?)""", values + (new_id, now_date))
+        for row in rows:
+            if row[0] not in used and row[3]:
+                cur.execute("UPDATE medications SET active=0 WHERE id=?", (row[0],))
+        cur.execute("RELEASE SAVEPOINT medication_sync")
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT medication_sync")
+        cur.execute("RELEASE SAVEPOINT medication_sync")
+        raise
     return obs_meds, None
 
 def sync_targets(conn: sqlite3.Connection):
@@ -206,7 +163,22 @@ def sync_targets(conn: sqlite3.Connection):
     return targets, None
 
 if __name__ == "__main__":
-    conn = sqlite3.connect(DB_PATH)
+    import argparse
+    parser = argparse.ArgumentParser(description='Sync existing health database; schema migration is explicit.')
+    parser.add_argument('command', nargs='?', choices=['sync', 'migrate'], default='sync')
+    args = parser.parse_args()
+    conn = sqlite3.connect(Path(DB_PATH).resolve().as_uri() + '?mode=rw', uri=True)
+    if args.command == 'migrate':
+        try:
+            cols = {r[1] for r in conn.execute('PRAGMA table_info(medications)')}
+            if not cols:
+                raise sqlite3.OperationalError('Missing medications table; initialize the health database separately.')
+            if 'food' not in cols:
+                with conn:
+                    conn.execute('ALTER TABLE medications ADD COLUMN food TEXT')
+        finally:
+            conn.close()
+        raise SystemExit(0)
     meds, warn_m = sync_medications(conn)
     targets, warn_t = sync_targets(conn)
     conn.close()

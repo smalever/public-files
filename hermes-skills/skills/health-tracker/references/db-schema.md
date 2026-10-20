@@ -13,7 +13,7 @@
 | dosage | TEXT | Дозировка, например `50 мг` |
 | frequency | TEXT | Частота приёма |
 | timing | TEXT | JSON-массив времён из поля `time` схемы (например `["20:00"]`); если времени в схеме нет — `[]`. Заполняет `health_sync.py`, на напоминания не влияет |
-| when_text | TEXT | Слот приёма: `morning`, `lunch`, `evening`, `wednesday_morning`, `morning_evening` (препарат в двух слотах) |
+| when_text | TEXT | Слот приёма: `morning`, `lunch`, `evening`, `wednesday_morning`, либо комбинация через `_` (`morning_lunch`, `morning_evening`, `lunch_evening`, `morning_lunch_evening`) |
 | note | TEXT | Заметка |
 | active | BOOLEAN DEFAULT 1 | Активен (1) или скрыт (0) |
 | added | DATE | Дата добавления |
@@ -25,19 +25,26 @@
 - `morning` — утренний слот
 - `lunch` — дневной слот
 - `evening` — вечерний слот
-- `wednesday_morning` — только по средам утром
-- `morning_evening` — один препарат и в утреннем, и в вечернем слоте
+- `wednesday_morning` — устаревший слот совместимости (legacy-слот еженедельного приёма по средам утром, не универсальное расписание)
+- `morning_lunch` — препарат в утреннем и дневном слотах
+- `morning_evening` — препарат в утреннем и вечернем слотах
+- `lunch_evening` — препарат в дневном и вечернем слотах
+- `morning_lunch_evening` — препарат в трёх дневных слотах
 
 ### SQL-паттерны
 
 ```sql
--- Все утренние лекарства (включая morning_evening)
+-- Все утренние лекарства (включая составные слоты)
 SELECT name, dosage FROM medications
-WHERE active=1 AND when_text IN ('morning', 'morning_evening');
+WHERE active=1 AND (when_text LIKE '%morning%');
 
--- Все вечерние лекарства (включая morning_evening)
+-- Все дневные лекарства
 SELECT name, dosage FROM medications
-WHERE active=1 AND when_text IN ('evening', 'morning_evening');
+WHERE active=1 AND (when_text LIKE '%lunch%');
+
+-- Все вечерние лекарства
+SELECT name, dosage FROM medications
+WHERE active=1 AND (when_text LIKE '%evening%');
 
 -- Конкретный день недели (среда)
 SELECT name, dosage FROM medications
@@ -166,11 +173,7 @@ CREATE TABLE documents (
 
 **`doctor_notes`** — заключения врачей:
 ```sql
-CREATE TABLE doctor_notes (
-    id INTEGER PK AUTOINCREMENT, date TEXT NOT NULL,
-    doctor_name TEXT, specialization TEXT,
-    conclusion TEXT NOT NULL, document_id INTEGER REFERENCES documents(id)
-);
+CREATE TABLE doctor_notes (\n    id INTEGER PK AUTOINCREMENT, date TEXT NOT NULL,\n    doctor_name TEXT, specialization TEXT,\n    conclusion TEXT NOT NULL, document_id INTEGER REFERENCES documents(id)\n);
 ```
 
 ## Формат дат — ВАЖНО

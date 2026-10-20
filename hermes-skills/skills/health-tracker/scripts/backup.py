@@ -1,21 +1,17 @@
 #!/opt/data/home/.venv/bin/python
 """
-Backup health.db to timestamped file.
+DEPRECATED / DISABLED: Raw SQLite file copy is unsafe for live databases.
 """
-import shutil
-import os
-from datetime import datetime
-
-DB_PATH = '/opt/data/personal/health/health.db'
-BACKUP_DIR = '/opt/data/personal/health/backups'
+import sys
 
 def backup():
-    if not os.path.exists(BACKUP_DIR):
-        os.makedirs(BACKUP_DIR)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = os.path.join(BACKUP_DIR, f'health_{timestamp}.db')
-    shutil.copy2(DB_PATH, backup_path)
-    print(f"Backup created: {backup_path}")
+    sys.stderr.write(
+        "ERROR: Direct execution of backup.py is disabled (fail-closed).\n"
+        "Automated live-database copy via shutil.copy is unsafe and prohibited.\n"
+        "Database backups and snapshots must be performed by the host administrator\n"
+        "using the verified unified backup-system or SQLite backup API.\n"
+    )
+    sys.exit(1)
 
 if __name__ == '__main__':
     backup()
