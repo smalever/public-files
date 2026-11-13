@@ -46,7 +46,7 @@ def fuzzy_threshold(word_len):
 
 def norm_text(s):
     """Нормализация для кириллицы без SQLite LOWER()."""
-    return (s or '').strip().lower().replace('ё', 'е')
+    return ' '.join((s or '').casefold().replace('ё', 'е').split())
 
 def _dedupe_rows(rows):
     seen = set()
@@ -136,6 +136,453 @@ def find_product(c, search):
         return rows, 'fuzzy_alias'
 
     return [], None
+
+def products_cmd(args):
+    """Search the complete food catalogue without writes or medication helpers."""
+    query = args.query.strip()
+    parts = norm_text(query).split()
+    if not parts:
+        print(json.dumps(dict(status='error', type='empty_query',
+                              message='Укажи непустой поисковый запрос.'), ensure_ascii=False))
+        raise SystemExit(2)
+    conn = get_conn()
+    try:
+        conn.execute('PRAGMA query_only=ON')
+        rows = conn.execute(
+            'SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db ORDER BY id'
+        ).fetchall()
+        aliases = {}
+        for row in conn.execute('SELECT alias, product FROM food_aliases ORDER BY alias'):
+            aliases.setdefault(row['product'], []).append(row['alias'])
+        matches = []
+        for row in rows:
+            names = [row['product'], row['normalized_name']] + aliases.get(row['product'], [])
+            text = norm_text(' '.join(name for name in names if name))
+            if all(part in text for part in parts):
+                matches.append(dict(row))
+    finally:
+        conn.close()
+    payload = dict(status='ok', query=query, count=len(matches), per_grams=100, products=matches)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(f'Найдено продуктов: {len(matches)}. КБЖУ на 100 г.')
+        for row in matches:
+            print(f"- ID {row['id']}: {row['product']} — {row['kcal']} ккал; "
+                  f"Б: {row['protein']} г, Ж: {row['fat']} г, У: {row['carbs']} г")
+
+
+def aliases_cmd(args):
+    """Read alias mappings, including dangling references hidden by product search."""
+    parts = norm_text(args.query or '').split()
+    conn = get_conn()
+    try:
+        conn.execute('PRAGMA query_only=ON')
+        products = conn.execute('SELECT id, product FROM food_db ORDER BY id').fetchall()
+        result = []
+        for row in conn.execute('SELECT alias, product FROM food_aliases ORDER BY alias, product'):
+            if not all(part in norm_text(row['alias'] + ' ' + row['product']) for part in parts):
+                continue
+            ids = [p['id'] for p in products if p['product'] == row['product']]
+            result.append(dict(row, product_ids=ids, dangling=not ids))
+    finally:
+        conn.close()
+    print(json.dumps(dict(status='ok', count=len(result), aliases=result), ensure_ascii=False))
+
+
+def product_add_cmd(args):
+    """Append one product; never overwrite history, aliases or catalogue entries."""
+    name = ' '.join(args.name.split())
+    fields = ('kcal', 'protein', 'fat', 'carbs')
+    expected = dict(product=name, normalized_name=norm_text(name),
+                    **{key: getattr(args, key) for key in fields})
+    conn = None
+    saved = False
+    kind = 'created'
+    failure_type = 'product_add_failed'
+    existing = []
+    try:
+        if not name or any(ord(ch) < 32 for ch in args.name):
+            raise ValueError('Нужно непустое название без управляющих символов.')
+        if any(not math.isfinite(expected[k]) or expected[k] < 0 or
+               expected[k] > (1000 if k == 'kcal' else 100) for k in fields) or sum(expected[k] for k in fields[1:]) > 100:
+            raise ValueError('КБЖУ на 100 г: конечные неотрицательные значения, ккал ≤ 1000, БЖУ и их сумма ≤ 100 г.')
+        conn = get_conn(write=True)
+        conn.execute('BEGIN IMMEDIATE')
+        rows = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db').fetchall()
+        existing = [dict(r) for r in rows if norm_text(name) in
+                    (norm_text(r['product']), norm_text(r['normalized_name']))]
+        aliases = [dict(r) for r in conn.execute('SELECT alias, product FROM food_aliases')
+                   if norm_text(r['alias']) == norm_text(name) or norm_text(r['product']) == norm_text(name)]
+        if existing:
+            if len(existing) != 1 or any(existing[0][k] != expected[k] for k in fields):
+                failure_type = 'product_conflict'
+                raise ValueError('Название уже существует с другими КБЖУ или неоднозначно; перезапись запрещена.')
+            if any(a['product'] != existing[0]['product'] for a in aliases):
+                failure_type = 'alias_conflict'
+                raise ValueError('Название конфликтует с существующей связью алиаса.')
+            expected = existing[0]
+            kind = 'already_exists'
+            conn.rollback()
+        else:
+            if aliases:
+                failure_type = 'alias_conflict'
+                raise ValueError('Название конфликтует с алиасом или его целью; нужна отдельная проверка связи.')
+            def authorize(action, table, column, database, trigger):
+                if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+                    if action != sqlite3.SQLITE_INSERT or table != 'food_db' or database != 'main' or trigger is not None:
+                        return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            conn.set_authorizer(authorize)
+            cursor = conn.execute('INSERT INTO food_db (product, normalized_name, kcal, protein, fat, carbs) VALUES (?, ?, ?, ?, ?, ?)',
+                                  tuple(expected[k] for k in ('product', 'normalized_name', *fields)))
+            expected = dict(id=cursor.lastrowid, **expected)
+            if conn.total_changes != 1:
+                raise ValueError('Добавление должно затронуть ровно один продукт.')
+            actual = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                                  (expected['id'],)).fetchone()
+            if actual is None or dict(actual) != expected:
+                raise ValueError('Проверка до commit не совпала с ожидаемым продуктом.')
+            conn.commit()
+            saved = True
+        conn.close()
+        conn = None
+        conn = get_conn()
+        conn.execute('PRAGMA query_only=ON')
+        actual = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                              (expected['id'],)).fetchone()
+        if actual is None or dict(actual) != expected:
+            raise ValueError('Проверка после commit не совпала с ожидаемым продуктом.')
+    except Exception as exc:
+        cleanup_errors = []
+        if conn is not None:
+            for operation in ('rollback', 'close'):
+                try:
+                    getattr(conn, operation)()
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f'{operation}: {cleanup_exc}')
+            conn = None
+        print(json.dumps(dict(status='error', type='verification_failed' if saved else failure_type,
+                              saved=saved, verified=False, product=expected, existing=existing,
+                              cleanup_errors=cleanup_errors, error=f'{type(exc).__name__}: {exc}'), ensure_ascii=False))
+        raise SystemExit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(dict(status='ok', type=kind, saved=saved, verified=True,
+                          per_grams=100, product=expected), ensure_ascii=False))
+
+
+def alias_add_cmd(args):
+    """Add a catalogue alias without replacing existing mappings or products."""
+    alias = ' '.join(args.alias.split())
+    conn = None
+    saved = False
+    product = None
+    product_id = None
+    kind = 'created'
+    failure_type = 'alias_add_failed'
+    existing = []
+    try:
+        if not alias or (args.id is not None and args.id <= 0) or (args.product is not None and not args.product.strip()):
+            raise ValueError('Нужны непустой алиас и положительный ID или точное название продукта.')
+        conn = get_conn(write=True)
+        conn.execute('BEGIN IMMEDIATE')
+        rows = conn.execute('SELECT id, product, normalized_name FROM food_db').fetchall()
+        targets = [r for r in rows if r['id'] == args.id] if args.id is not None else [r for r in rows if r['product'] == args.product]
+        if len(targets) != 1:
+            raise ValueError('Продукт не найден однозначно; укажи существующий ID или точное название.')
+        product_id, product = targets[0]['id'], targets[0]['product']
+        alias_norm = norm_text(alias)
+        if any(r['id'] != product_id and alias_norm in (norm_text(r['product']), norm_text(r['normalized_name'])) for r in rows):
+            raise ValueError('Алиас совпадает с названием другого продукта.')
+        existing = [r for r in conn.execute('SELECT alias, product FROM food_aliases')
+                    if norm_text(r['alias']) == alias_norm]
+        if any(not any(p['product'] == r['product'] for p in rows) for r in existing):
+            failure_type = 'dangling_alias'
+            raise ValueError('Алиас ссылается на отсутствующий продукт. Нужна отдельная согласованная правка связи; автоматическая замена запрещена.')
+        if any(r['product'] != product for r in existing):
+            failure_type = 'alias_conflict'
+            raise ValueError('Алиас уже связан с другим продуктом; перезапись запрещена.')
+        if existing:
+            kind = 'already_exists'
+            alias = existing[0]['alias']
+            conn.rollback()
+        else:
+            def authorize(action, table, column, database, trigger):
+                if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+                    if action != sqlite3.SQLITE_INSERT or table != 'food_aliases' or database != 'main' or trigger is not None:
+                        return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            conn.set_authorizer(authorize)
+            conn.execute('INSERT INTO food_aliases (alias, product) VALUES (?, ?)', (alias, product))
+            if conn.total_changes != 1:
+                raise ValueError('Добавление должно затронуть ровно один алиас.')
+            conn.commit()
+            saved = True
+        conn.close()
+        conn = None
+        conn = get_conn()
+        conn.execute('PRAGMA query_only=ON')
+        actual = conn.execute('SELECT alias, product FROM food_aliases WHERE alias=?', (alias,)).fetchall()
+        if len(actual) != 1 or tuple(actual[0]) != (alias, product):
+            raise ValueError('Проверка сохранённого алиаса не совпала с ожидаемым результатом.')
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        print(json.dumps(dict(status='error', type='verification_failed' if saved else failure_type,
+                              existing=[dict(r) for r in existing],
+                              saved=saved, verified=False, alias=alias, product=product, product_id=product_id,
+                              error=f'{type(exc).__name__}: {exc}'), ensure_ascii=False))
+        raise SystemExit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(dict(status='ok', type=kind, saved=saved, verified=True,
+                          alias=alias, product=product, product_id=product_id), ensure_ascii=False))
+
+
+def alias_update_cmd(args):
+    """Preview and confirm exactly one alias target change, with verified backup."""
+    import hashlib
+    import tempfile
+    conn = None
+    backup_path = None
+    saved = verified = False
+    payload = {}
+    try:
+        if not norm_text(args.alias) or args.id <= 0 or (args.confirm and not args.apply):
+            raise ValueError('Нужны непустой алиас, положительный ID; --confirm только с --apply.')
+        conn = get_conn()
+        conn.execute('PRAGMA query_only=ON')
+        aliases = [dict(r) for r in conn.execute('SELECT alias, product FROM food_aliases')
+                   if norm_text(r['alias']) == norm_text(args.alias)]
+        products = [dict(r) for r in conn.execute('SELECT id, product, normalized_name FROM food_db')]
+        targets = [p for p in products if p['id'] == args.id]
+        if len(aliases) != 1 or len(targets) != 1:
+            raise ValueError('Нужен один однозначный существующий алиас и существующий ID продукта.')
+        before = aliases[0]
+        target = targets[0]
+        if sum(p['product'] == target['product'] for p in products) != 1:
+            raise ValueError('Название целевого продукта неоднозначно.')
+        if any(p['id'] != args.id and norm_text(before['alias']) in
+               (norm_text(p['product']), norm_text(p['normalized_name'])) for p in products):
+            raise ValueError('Алиас совпадает с названием другого продукта.')
+        after = dict(alias=before['alias'], product=target['product'])
+        if before == after:
+            raise ValueError('Связь уже соответствует цели; изменение не требуется.')
+        confirmation = hashlib.sha256(json.dumps(dict(database=str(Path(DB_PATH).resolve()),
+            before=before, after=after, target=target), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        payload = dict(before=before, after=after, product_id=args.id, confirmation=confirmation)
+        conn.close()
+        conn = None
+        if not args.apply:
+            print(json.dumps(dict(payload, status='ok', type='preview', saved=False, verified=False), ensure_ascii=False))
+            return
+        if args.confirm != confirmation:
+            raise ValueError('Подтверждение не соответствует актуальному preview.')
+        conn = get_conn(write=True)
+        conn.execute('BEGIN IMMEDIATE')
+        current_aliases = [dict(r) for r in conn.execute('SELECT alias, product FROM food_aliases')
+                           if norm_text(r['alias']) == norm_text(args.alias)]
+        current_products = [dict(r) for r in conn.execute('SELECT id, product, normalized_name FROM food_db')]
+        if current_aliases != aliases or current_products != products:
+            raise ValueError('Справочник изменился после preview; повтори preview.')
+        source = get_conn()
+        try:
+            before_dump = list(source.iterdump())
+            fd, backup_path = tempfile.mkstemp(prefix='alias-update-', suffix='.sqlite', dir=Path(DB_PATH).resolve().parent)
+            os.close(fd)
+            backup = sqlite3.connect(Path(backup_path).as_uri() + '?mode=rw', uri=True)
+            try:
+                source.backup(backup)
+                if backup.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or list(backup.iterdump()) != before_dump:
+                    raise ValueError('Страховочная копия не прошла проверку.')
+                backup.execute('UPDATE food_aliases SET product=? WHERE alias=? AND product=?',
+                               (after['product'], before['alias'], before['product']))
+                expected_dump = list(backup.iterdump())
+                backup.rollback()
+                if list(backup.iterdump()) != before_dump:
+                    raise ValueError('Страховочная копия изменена при проверке.')
+            finally:
+                backup.close()
+        finally:
+            source.close()
+        def authorize(action, table, column, database, trigger):
+            if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE):
+                if action != sqlite3.SQLITE_UPDATE or table != 'food_aliases' or column != 'product' or database != 'main' or trigger is not None:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        conn.set_authorizer(authorize)
+        cur = conn.execute('UPDATE food_aliases SET product=? WHERE alias=? AND product=?',
+                           (after['product'], before['alias'], before['product']))
+        if cur.rowcount != 1 or conn.total_changes != 1 or list(conn.iterdump()) != expected_dump:
+            raise ValueError('Изменение вышло за пределы одной согласованной связи.')
+        conn.commit()
+        saved = True
+        conn.close()
+        conn = None
+        conn = get_conn()
+        conn.execute('PRAGMA query_only=ON')
+        if list(conn.iterdump()) != expected_dump or [tuple(r) for r in conn.execute('PRAGMA integrity_check')] != [('ok',)]:
+            raise ValueError('Проверка после commit не пройдена.')
+        verified = True
+        conn.close()
+        conn = None
+        os.unlink(backup_path)
+    except Exception as exc:
+        cleanup_errors = []
+        if conn is not None:
+            for operation in ('rollback', 'close'):
+                try:
+                    getattr(conn, operation)()
+                except Exception as error:
+                    cleanup_errors.append(f'{operation}: {error}')
+            conn = None
+        print(json.dumps(dict(payload, status='error', saved=saved, verified=verified,
+            type='cleanup_failed' if verified else 'verification_failed' if saved else 'alias_update_failed',
+            backup_path=backup_path, cleanup_errors=cleanup_errors, error=f'{type(exc).__name__}: {exc}'), ensure_ascii=False))
+        raise SystemExit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(dict(payload, status='ok', type='updated', saved=True, verified=True,
+                          backup_path=backup_path, backup_removed=True), ensure_ascii=False))
+
+
+def product_update_cmd(args):
+    """Preview one exact catalogue edit; applying requires the preview fingerprint."""
+    import hashlib
+    fields = ('kcal', 'protein', 'fat', 'carbs')
+    changes = {key: getattr(args, key) for key in fields if getattr(args, key) is not None}
+    def fail(kind, message):
+        print(json.dumps(dict(status='error', type=kind, saved=False, verified=False,
+                              message=message), ensure_ascii=False))
+        raise SystemExit(2)
+    if args.id <= 0 or not args.name.strip() or not changes:
+        fail('invalid_request', 'Нужны положительный ID, точное название и хотя бы одно поле КБЖУ.')
+    if any(not math.isfinite(v) or v < 0 or v > (1000 if k == 'kcal' else 100)
+           for k, v in changes.items()):
+        fail('invalid_values', 'КБЖУ должны быть конечными и неотрицательными: ккал ≤ 1000, БЖУ ≤ 100 г.')
+    conn = None
+    try:
+        conn = get_conn()
+        conn.execute('PRAGMA query_only=ON')
+        row = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                           (args.id,)).fetchone()
+        conn.close()
+        conn = None
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        fail('database_error', f'{type(exc).__name__}: {exc}')
+    if row is None or row['product'] != args.name:
+        fail('target_mismatch', 'ID и точное название не соответствуют продукту.')
+    before = dict(row)
+    after = dict(before, **changes)
+    if any(not isinstance(after[k], (int, float)) or not math.isfinite(after[k]) or after[k] < 0
+           or after[k] > (1000 if k == 'kcal' else 100) for k in fields) or sum(after[k] for k in fields[1:]) > 100:
+        fail('invalid_values', 'Итоговые значения некорректны или сумма БЖУ превышает 100 г.')
+    confirmation = hashlib.sha256(json.dumps(
+        dict(database=str(Path(DB_PATH).resolve()), before=before, after=after, changes=changes),
+        sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    payload = dict(before=before, after=after, per_grams=100, confirmation=confirmation,
+                   saved=False, verified=False)
+    if not args.apply:
+        if args.confirm:
+            fail('invalid_request', '--confirm допустим только вместе с --apply.')
+        print(json.dumps(dict(payload, status='ok', type='preview'), ensure_ascii=False))
+        return
+    if not args.confirm or not re.fullmatch(r'[0-9a-f]{64}', args.confirm) or args.confirm != confirmation:
+        fail('confirmation_mismatch', 'Нужно подтверждение актуального preview с теми же значениями.')
+
+    import tempfile
+    backup_path = None
+    saved = False
+    verified = False
+    conn = None
+    try:
+        conn = get_conn(write=True)
+        conn.execute('BEGIN IMMEDIATE')
+        current = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                               (args.id,)).fetchone()
+        if current is None or dict(current) != before:
+            raise ValueError('Продукт изменился после preview; запроси новое подтверждение.')
+        # Separate reader sees the same committed snapshot while BEGIN IMMEDIATE blocks writers.
+        source = get_conn()
+        try:
+            fd, backup_path = tempfile.mkstemp(prefix='product-update-', suffix='.sqlite',
+                                               dir=Path(DB_PATH).resolve().parent)
+            os.close(fd)
+            backup = sqlite3.connect(Path(backup_path).as_uri() + '?mode=rw', uri=True)
+            try:
+                source.backup(backup)
+                if backup.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise ValueError('Страховочная копия не прошла integrity_check.')
+                if list(source.iterdump()) != list(backup.iterdump()):
+                    raise ValueError('Страховочная копия не совпадает с источником.')
+            finally:
+                backup.close()
+        finally:
+            source.close()
+        # Fail closed on trigger writes and on writes outside the requested columns.
+        def authorize(action, table, column, database, trigger):
+            if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+                return sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_UPDATE:
+                if database != 'main' or table != 'food_db' or column not in changes or trigger is not None:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        conn.set_authorizer(authorize)
+        # Column names originate exclusively from the fixed field whitelist above.
+        assignments = ', '.join(key + '=?' for key in changes)
+        cursor = conn.execute('UPDATE food_db SET ' + assignments + ' WHERE id=? AND product=?',
+                              (*changes.values(), args.id, args.name))
+        if cursor.rowcount != 1 or conn.total_changes != 1:
+            raise ValueError('Обновление должно затронуть ровно один продукт.')
+        actual = conn.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                              (args.id,)).fetchone()
+        if actual is None or dict(actual) != after:
+            raise ValueError('Проверка до commit не совпала с ожидаемым результатом.')
+        conn.commit()
+        saved = True
+        conn.close()
+        conn = None
+        check = get_conn()
+        try:
+            check.execute('PRAGMA query_only=ON')
+            actual = check.execute('SELECT id, product, normalized_name, kcal, protein, fat, carbs FROM food_db WHERE id=?',
+                                   (args.id,)).fetchone()
+            if actual is None or dict(actual) != after:
+                raise ValueError('Проверка после commit не совпала с ожидаемым результатом.')
+        finally:
+            check.close()
+        verified = True
+        os.unlink(backup_path)
+    except Exception as exc:
+        cleanup_errors = []
+        if conn is not None:
+            for operation in ('rollback', 'close'):
+                try:
+                    getattr(conn, operation)()
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f'{operation}: {type(cleanup_exc).__name__}: {cleanup_exc}')
+            conn = None
+        print(json.dumps(dict(payload, status='error', saved=saved, verified=verified,
+                              cleanup_errors=cleanup_errors,
+                              type='cleanup_failed' if verified else 'verification_failed' if saved else 'update_failed',
+                              backup_path=backup_path, error=f'{type(exc).__name__}: {exc}',
+                              message='Не повторяй запись вслепую; копия сохранена, если была создана.'), ensure_ascii=False))
+        raise SystemExit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(dict(payload, status='ok', type='updated', saved=True, verified=True,
+                          backup_path=backup_path, backup_removed=True), ensure_ascii=False))
+
 
 def load_medication_reminder_helper(loader=None):
     """Load the optional medication helper without invalidating a saved meal."""
@@ -617,6 +1064,49 @@ def take_meds_cmd(args):
 def main():
     parser = argparse.ArgumentParser(description='Nutrition Tracker')
     subparsers = parser.add_subparsers(dest='command')
+
+    products_parser = subparsers.add_parser('products', help='Поиск продуктов и алиасов (только чтение)')
+    products_parser.add_argument('--query', required=True, help='Все слова запроса должны присутствовать в названии/алиасах')
+    products_parser.add_argument('--json', action='store_true', help='Список продуктов и КБЖУ на 100 г в JSON')
+    products_parser.set_defaults(func=products_cmd)
+
+    add_product_parser = subparsers.add_parser('product-add', help='Добавить новый продукт без перезаписи (КБЖУ на 100 г)')
+    add_product_parser.add_argument('--name', required=True)
+    for field in ('kcal', 'protein', 'fat', 'carbs'):
+        add_product_parser.add_argument('--' + field, type=float, required=True)
+    add_product_parser.add_argument('--json', action='store_true', help='Всегда возвращается проверенный JSON receipt')
+    add_product_parser.set_defaults(func=product_add_cmd)
+
+    aliases_parser = subparsers.add_parser('aliases', help='Просмотр связей алиасов, включая устаревшие (только чтение)')
+    aliases_parser.add_argument('--query', help='Фильтр по словам алиаса или названия цели; без флага — весь список')
+    aliases_parser.add_argument('--json', action='store_true', help='Всегда возвращается JSON')
+    aliases_parser.set_defaults(func=aliases_cmd)
+
+    alias_parser = subparsers.add_parser('alias-add', help='Добавить алиас существующему продукту (без перезаписи)')
+    alias_parser.add_argument('--alias', required=True)
+    target = alias_parser.add_mutually_exclusive_group(required=True)
+    target.add_argument('--id', type=int, help='ID продукта')
+    target.add_argument('--product', help='Точное название продукта, не алиас')
+    alias_parser.add_argument('--json', action='store_true', help='Всегда возвращается JSON')
+    alias_parser.set_defaults(func=alias_add_cmd)
+
+    alias_update_parser = subparsers.add_parser('alias-update', help='Preview/apply изменения цели одного алиаса')
+    alias_update_parser.add_argument('--alias', required=True)
+    alias_update_parser.add_argument('--id', type=int, required=True, help='ID нового целевого продукта')
+    alias_update_parser.add_argument('--apply', action='store_true')
+    alias_update_parser.add_argument('--confirm', help='Fingerprint согласованного preview')
+    alias_update_parser.add_argument('--json', action='store_true', help='Всегда возвращается JSON')
+    alias_update_parser.set_defaults(func=alias_update_cmd)
+
+    update_parser = subparsers.add_parser('product-update', help='Preview/apply КБЖУ одного точного продукта (JSON)')
+    update_parser.add_argument('--id', type=int, required=True)
+    update_parser.add_argument('--name', required=True, help='Точное название, не алиас')
+    for field in ('kcal', 'protein', 'fat', 'carbs'):
+        update_parser.add_argument('--' + field, type=float, help='Новое значение на 100 г; без флага — не менять')
+    update_parser.add_argument('--apply', action='store_true')
+    update_parser.add_argument('--confirm', help='Fingerprint подтверждённого preview')
+    update_parser.add_argument('--json', action='store_true', help='Всегда возвращается JSON')
+    update_parser.set_defaults(func=product_update_cmd)
 
     meal_parser = subparsers.add_parser('meal', help='Add meal')
     meal_parser.add_argument('--meal', required=True, choices=['breakfast', 'lunch', 'dinner', 'snack'])

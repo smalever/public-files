@@ -67,6 +67,7 @@ def sync_medications(conn: sqlite3.Connection):
 
     # One row per name + atomic slot; names are not unique in this schema.
     defaults = {"morning": "утром", "lunch": "днём во время еды",
+                "tuesday_morning": "по вторникам утром",
                 "wednesday_morning": "по средам утром", "evening": "вечером"}
     # Validate the entire source before any SQL mutation, including ignored PRN entries.
     for slot, entries in obs_meds.items():

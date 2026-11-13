@@ -130,7 +130,7 @@ def get_active_meds_for_slot(slot: str, date_str: str = None):
         date_str = datetime.now(MSK).strftime("%Y-%m-%d")
 
     dt = datetime.strptime(date_str, "%Y-%m-%d")
-    is_wednesday = (dt.weekday() == 2)
+    weekly_slot = {1: "tuesday_morning", 2: "wednesday_morning"}.get(dt.weekday())
 
     # 1. Try Obsidian
     frontmatter = _parse_frontmatter(MEDS_NOTE_PATH)
@@ -140,9 +140,9 @@ def get_active_meds_for_slot(slot: str, date_str: str = None):
         if slot in SLOTS:
             for m in meds_section.get(slot, []) or []:
                 res.append(_med_from_note(m))
-        if slot == "morning" and is_wednesday:
-            for m in meds_section.get("wednesday_morning", []) or []:
-                res.append(_med_from_note(m, "по средам"))
+        if slot == "morning" and weekly_slot:
+            for m in meds_section.get(weekly_slot, []) or []:
+                res.append(_med_from_note(m, "по вторникам" if weekly_slot == "tuesday_morning" else "по средам"))
         return [m for m in res if m["name"]]
 
     # 2. Fallback to SQLite medications table
@@ -165,12 +165,12 @@ def get_active_meds_for_slot(slot: str, date_str: str = None):
             "note": note,
             "food": normalize_food_timing(r["food"] if food_col else None, note),
         }
-        atoms = when.replace("wednesday_morning", "weekly").split("_")
-        slots = {"wednesday_morning" if atom == "weekly" else atom for atom in atoms}
-        if slots - {"morning", "lunch", "evening", "wednesday_morning"}:
+        atoms = when.replace("wednesday_morning", "weekly").replace("tuesday_morning", "tuesdayweekly").split("_")
+        slots = {"wednesday_morning" if atom == "weekly" else "tuesday_morning" if atom == "tuesdayweekly" else atom for atom in atoms}
+        if slots - {"morning", "lunch", "evening", "wednesday_morning", "tuesday_morning"}:
             continue
         if slot in SLOTS and (slot in slots or
-                (slot == "morning" and is_wednesday and "wednesday_morning" in slots)):
+                (slot == "morning" and weekly_slot in slots)):
             res.append(med)
 
     return res
@@ -211,12 +211,13 @@ def is_slot_taken(slot: str, date_str: str) -> bool:
 
 CATALOG_SLOT_RU = {
     "morning": "утро",
+    "tuesday_morning": "утро по вторникам",
     "wednesday_morning": "утро по средам",
     "lunch": "день",
     "evening": "вечер",
     "as_needed": "по потребности",
 }
-CATALOG_SLOT_ORDER = ("morning", "wednesday_morning", "lunch", "evening", "as_needed")
+CATALOG_SLOT_ORDER = ("morning", "tuesday_morning", "wednesday_morning", "lunch", "evening", "as_needed")
 
 
 def get_medication_catalog() -> list:
@@ -266,8 +267,8 @@ def get_medication_catalog() -> list:
             for r in conn.execute(f"SELECT name, dosage, when_text, note{optional} FROM medications WHERE active = 1"):
                 # Protect the weekly atom before decoding legacy underscore combinations.
                 when = (r["when_text"] or "").strip().casefold()
-                atoms = when.replace("wednesday_morning", "weekly").split("_")
-                slots = ["wednesday_morning" if atom == "weekly" else atom for atom in atoms]
+                atoms = when.replace("wednesday_morning", "weekly").replace("tuesday_morning", "tuesdayweekly").split("_")
+                slots = ["wednesday_morning" if atom == "weekly" else "tuesday_morning" if atom == "tuesdayweekly" else atom for atom in atoms]
                 if any(s not in CATALOG_SLOT_ORDER for s in slots):
                     continue
                 times = []
@@ -372,7 +373,7 @@ FOCUS_DAILY_SLOTS = (("morning", "утром"), ("lunch", "днём"), ("evening
 def format_week_focus_lines(catalog: list = None) -> list:
     """Строки чек-листа «Фокус недели» по актуальной схеме (без хардкода препаратов).
 
-    Еженедельные инъекции (`wednesday_morning`) — отдельными строками, затем
+    Еженедельные инъекции (`tuesday_morning`, `wednesday_morning`) — отдельными строками, затем
     ежедневные слоты: препараты сгруппированы по признаку приёма относительно еды.
     Препараты «по потребности» в чек-лист не входят.
     """
@@ -383,12 +384,13 @@ def format_week_focus_lines(catalog: list = None) -> list:
             by_slot.setdefault(s["slot"], []).append((e["name"], s))
 
     lines = []
-    for name, s in by_slot.get("wednesday_morning", []):
+    for name, s in by_slot.get("tuesday_morning", []) + by_slot.get("wednesday_morning", []):
         tag = dict(FOCUS_FOOD_ORDER).get(s["food"]) if s["food"] != "any" else None
         when = "утром" + (f", {tag}" if tag else "")
         extra = f" ({s['note']})" if s["note"] else ""
         dose = f" — {s['dosage']}" if s["dosage"] else ""
-        lines.append(f"- [ ] **Среда ({when}):** {med_short_name(name)}{dose}{extra}.")
+        day = "Вторник" if s["slot"] == "tuesday_morning" else "Среда"
+        lines.append(f"- [ ] **{day} ({when}):** {med_short_name(name)}{dose}{extra}.")
 
     for slot, title in FOCUS_DAILY_SLOTS:
         items = by_slot.get(slot, [])
@@ -483,6 +485,8 @@ def mark_meds_taken(
                 candidates = [r for r in medication_rows
                               if med_key(r["name"]) == med_key(m["name"])
                               and slot in (r["when_text"] or "").casefold()
+                              and ("tuesday" not in (r["when_text"] or "").casefold()
+                                   or datetime.strptime(date_str, "%Y-%m-%d").weekday() == 1)
                               and ("wednesday" not in (r["when_text"] or "").casefold()
                                    or datetime.strptime(date_str, "%Y-%m-%d").weekday() == 2)]
                 candidates.sort(key=lambda r: (

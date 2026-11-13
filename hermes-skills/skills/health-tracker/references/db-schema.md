@@ -25,7 +25,8 @@
 - `morning` — утренний слот
 - `lunch` — дневной слот
 - `evening` — вечерний слот
-- `wednesday_morning` — устаревший слот совместимости (legacy-слот еженедельного приёма по средам утром, не универсальное расписание)
+- `tuesday_morning` — только по вторникам утром
+- `wednesday_morning` — только по средам утром
 - `morning_lunch` — препарат в утреннем и дневном слотах
 - `morning_evening` — препарат в утреннем и вечернем слотах
 - `lunch_evening` — препарат в дневном и вечернем слотах
@@ -34,19 +35,19 @@
 ### SQL-паттерны
 
 ```sql
--- Все утренние лекарства (включая составные слоты)
+-- Ежедневные утренние лекарства (еженедельный слот отдельно ниже)
 SELECT name, dosage FROM medications
-WHERE active=1 AND (when_text LIKE '%morning%');
+WHERE active=1 AND when_text IN ('morning', 'morning_lunch', 'morning_evening', 'morning_lunch_evening');
 
 -- Все дневные лекарства
 SELECT name, dosage FROM medications
-WHERE active=1 AND (when_text LIKE '%lunch%');
+WHERE active=1 AND when_text IN ('lunch', 'morning_lunch', 'lunch_evening', 'morning_lunch_evening');
 
 -- Все вечерние лекарства
 SELECT name, dosage FROM medications
-WHERE active=1 AND (when_text LIKE '%evening%');
+WHERE active=1 AND when_text IN ('evening', 'morning_evening', 'lunch_evening', 'morning_lunch_evening');
 
--- Конкретный день недели (среда)
+-- Еженедельный слот: добавлять к утренним только для даты среды
 SELECT name, dosage FROM medications
 WHERE active=1 AND when_text='wednesday_morning';
 
@@ -59,7 +60,7 @@ SELECT id, name, dosage, when_text, food FROM medications WHERE active=1;
 
 ## Таблицы приёма препаратов
 
-Пишутся только через `health.py take-meds` / `nutrition.py take-meds`.
+Плановые приёмы пишутся через `health.py take-meds` / `nutrition.py take-meds`, а также `health.py medication` для препарата из схемы (поддерживает `--slot`). Разовый приём вне схемы остаётся только в `med_log`.
 
 **`med_intake_log`** — отметка по каждому препарату:
 
@@ -91,7 +92,7 @@ SELECT id, name, dosage, when_text, food FROM medications WHERE active=1;
 | method | TEXT | Способ/время (копируется из medications.when_text) |
 | med_id TEXT | FK → medications.id | |
 
-**Запись:** только через `scripts/health.py medication`, не вручную.
+**Запись:** через `health.py take-meds` / `nutrition.py take-meds` и `health.py medication`, не вручную. Плановый приём также отражается в `med_intake_log`; разовый вне схемы — только здесь.
 
 ```sql
 -- Последние приёмы

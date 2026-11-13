@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'scripts' / 'nutrition.py'
-SCRATCH = Path(os.environ.get('TMPDIR', '/tmp'))
+SCRATCH = Path(os.environ.get('TMPDIR') or ('/opt/data/cache/scratch' if Path('/opt/data/cache/scratch').exists() else tempfile.gettempdir()))
 
 
 class MealCLI(unittest.TestCase):
